@@ -1,0 +1,57 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Env / secrets
+.env
+*.env.*
+!*.env.example
+cookies.txt
+*.cookies
+
+# Tools
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# SQLite databases (queue.db + any test artifacts)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/
+
+# Local config scratch space
+config.local.*
+
+# Raw captured requests (may contain live session cookies)
+raw/
+
+# Download working directories
+tmp/
+output/
+
+# OS
+.DS_Store
+Thumbs.db

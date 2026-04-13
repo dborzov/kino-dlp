@@ -1,0 +1,544 @@
+"""
+downloader.py — Per-task download orchestration.
+
+download_task(task, state)
+  Full flow for one task: manifest → streams → ffmpeg → merge → cleanup.
+  Streams are tracked individually in the DB (granular resume support).
+
+add_audio_to_task(task_id, url, label, state)
+  Download an extra audio track and remux into the existing MKV.
+
+add_sub_to_task(task_id, url, lang, state)
+  Download an extra subtitle and save as a .srt sidecar.
+"""
+
+import shutil
+from pathlib import Path
+
+from .db import (
+    db_get_item,
+    db_get_streams,
+    db_get_task,
+    db_increment_attempts,
+    db_log,
+    db_set_task_status,
+    db_update_stream,
+    db_upsert_stream,
+)
+from .ffmpeg import (
+    StallError,
+    clean_track_name,
+    download_audio_stream,
+    download_subtitle_stream,
+    download_video_stream,
+    lang_from_sub_url,
+    lang_from_track_name,
+    merge_into_mkv,
+    remux_add_audio,
+)
+from .scraper import (
+    CookieExpiredError,
+    get_manifest_url,
+    parse_manifest,
+    scaffold,
+    select_streams,
+)
+from .ws_protocol import EVT_STREAM_PROGRESS, EVT_STREAM_UPDATE, EVT_TASK_ERROR, EVT_TASK_UPDATE
+
+MAX_ATTEMPTS = 3
+
+
+async def download_task(task: dict, state) -> None:
+    """
+    Main download coroutine for one task.
+    Handles resume, per-stream progress, retry logic.
+    """
+    from .db import db_set_cookie_error, db_set_paused
+    from .scheduler import db_run, net_run
+    from .ws_server import broadcast
+
+    task_id = task["id"]
+    config  = state.config
+    conn    = state.conn
+
+    def log(level: str, msg: str):
+        state.loop.create_task(
+            db_run(state, db_log, conn, level, msg, task_id)
+        )
+        print(f"[task {task_id}] {level}: {msg}")
+
+    log("INFO", f"Starting task — {task.get('plex_stem') or task.get('episode_title') or task['kind']}")
+
+    # ── 0. Check if output already exists ─────────────────────────────────────
+    mkv_path = Path(config.output_dir) / f"{task['plex_stem']}.mkv"
+    if mkv_path.exists() and mkv_path.stat().st_size > 0:
+        log("INFO", f"Output already exists: {mkv_path.name}")
+        await db_run(state, db_set_task_status, conn, task_id, "done",
+                     mkv_path=str(mkv_path))
+        await broadcast(state, {"type": EVT_TASK_UPDATE, "task_id": task_id,
+                                "status": "done", "mkv_path": str(mkv_path)})
+        return
+
+    # ── 1. Get item metadata ───────────────────────────────────────────────────
+    item = await db_run(state, db_get_item, conn, task["item_id"])
+    if not item:
+        log("ERROR", "Item not found in DB — this should not happen")
+        await db_run(state, db_set_task_status, conn, task_id, "failed",
+                     error="Item not in DB")
+        return
+
+    # ── 2. Get fresh manifest ─────────────────────────────────────────────────
+    log("INFO", f"Resolving manifest for S{task['season']:02d}E{task['episode']:02d}...")
+    try:
+        manifest_url, ep_info = await net_run(
+            state, get_manifest_url,
+            task["item_id"], task["season"], task["episode"]
+        )
+        manifest = await net_run(state, parse_manifest, manifest_url)
+    except CookieExpiredError as e:
+        log("ERROR", f"Cookie expired: {e}")
+        await db_run(state, db_set_cookie_error, conn, True)
+        await db_run(state, db_set_paused, conn, True)
+        state.pause_event.clear()
+        attempts = await db_run(state, db_increment_attempts, conn, task_id)
+        from .ws_protocol import EVT_COOKIE_ERROR
+        await broadcast(state, {
+            "type": EVT_COOKIE_ERROR,
+            "msg": "Session cookies expired — upload new cookies to resume."
+        })
+        return
+    except Exception as e:
+        log("ERROR", f"Manifest fetch failed: {e}")
+        attempts = await db_run(state, db_increment_attempts, conn, task_id)
+        if attempts >= MAX_ATTEMPTS:
+            await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+        await broadcast(state, {
+            "type": EVT_TASK_ERROR, "task_id": task_id,
+            "error": str(e), "attempt": attempts,
+            "will_retry": attempts < MAX_ATTEMPTS,
+        })
+        return
+
+    # ── 3. Select streams per config ──────────────────────────────────────────
+    selected = select_streams(manifest, config)
+    video    = selected["video"]
+    audios   = selected["audio"]
+    subs     = selected["subtitles"]
+
+    log("INFO", f"Streams: video={'yes' if video else 'none'} "
+        f"audio={len(audios)} sub={len(subs)}")
+
+    # ── 4. Scaffold Plex dirs ─────────────────────────────────────────────────
+    try:
+        await net_run(state, scaffold, item_from_meta(item), config.output_dir)
+    except Exception as e:
+        log("WARN", f"Scaffold error (non-fatal): {e}")
+
+    # ── 5. Create/ensure stream rows in DB ───────────────────────────────────
+    work_dir = Path(config.tmp_dir) / Path(task["plex_stem"]).name
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    duration_sec = ep_info.get("duration") or ep_info.get("duration_sec")
+
+    # Register streams in DB (INSERT OR IGNORE preserves existing done/downloading ones)
+    stream_ids: dict[str, int] = {}
+
+    if video:
+        sid = await db_run(state, db_upsert_stream, conn,
+            task_id=task_id, stream_type="video",
+            label=f"Video {video.get('resolution', '')}",
+            lang=None, forced=False,
+            source_url=video["uri"],
+            tmp_path=str(work_dir / "video.mkv"),
+        )
+        stream_ids["video"] = sid
+
+    for i, at in enumerate(audios):
+        label = at.get("name", f"Audio {i+1}")
+        sid = await db_run(state, db_upsert_stream, conn,
+            task_id=task_id, stream_type="audio",
+            label=label,
+            lang=lang_from_track_name(label) or at.get("language"),
+            forced=False,
+            source_url=at["uri"],
+            tmp_path=str(work_dir / f"audio_{i+1}.m4a"),
+        )
+        stream_ids[f"audio_{i}"] = sid
+
+    for i, st in enumerate(subs):
+        lang = st.get("language", "und")
+        label = st.get("name", lang)
+        # Sub sidecars go directly to output dir
+        out_stem = Path(config.output_dir) / task["plex_stem"]
+        lang_idx = i + 1
+        out_path = str(out_stem.parent / f"{out_stem.name}.{lang}.srt") if lang_idx == 1 \
+                   else str(out_stem.parent / f"{out_stem.name}.{lang}.{lang_idx}.srt")
+        sid = await db_run(state, db_upsert_stream, conn,
+            task_id=task_id, stream_type="subtitle",
+            label=label,
+            lang=lang,
+            forced=st.get("forced", False),
+            source_url=st["uri"],
+            out_path=out_path,
+        )
+        stream_ids[f"sub_{i}"] = sid
+
+    # ── 6. Download subtitle sidecars (fast, do these first) ─────────────────
+    for i, st in enumerate(subs):
+        sid = stream_ids.get(f"sub_{i}")
+        if not sid:
+            continue
+
+        stream = await db_run(state, lambda c, s: c.execute(
+            "SELECT * FROM streams WHERE id=?", (s,)).fetchone(), conn, sid)
+        if stream and stream["status"] == "done":
+            log("INFO", f"Sub {i+1} already done — skip")
+            continue
+
+        out_path_str = stream["out_path"] if stream else None
+        if not out_path_str:
+            continue
+        out_path = Path(out_path_str)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lang = st.get("language", "und")
+        log("INFO", f"Downloading subtitle [{lang.upper()}]...")
+        await db_run(state, db_update_stream, conn, sid, status="downloading")
+
+        try:
+            ok = await download_subtitle_stream(st["uri"], out_path, stall_timeout=120)
+            if ok:
+                await db_run(state, db_update_stream, conn, sid,
+                             status="done",
+                             size_bytes=out_path.stat().st_size if out_path.exists() else None)
+                await broadcast(state, {
+                    "type": EVT_STREAM_UPDATE, "stream_id": sid,
+                    "task_id": task_id, "status": "done",
+                })
+                log("INFO", f"Sub [{lang.upper()}] done → {out_path.name}")
+            else:
+                await db_run(state, db_update_stream, conn, sid, status="failed",
+                             error="ffmpeg returned non-zero")
+                log("WARN", f"Sub [{lang.upper()}] download failed")
+        except StallError as e:
+            await db_run(state, db_update_stream, conn, sid, status="failed", error=str(e))
+            log("WARN", f"Sub [{lang.upper()}] stalled: {e}")
+        except Exception as e:
+            await db_run(state, db_update_stream, conn, sid, status="failed", error=str(e))
+            log("ERROR", f"Sub [{lang.upper()}] error: {e}")
+
+    # ── 7. Download video ─────────────────────────────────────────────────────
+    if not video:
+        log("WARN", "No video stream selected — skipping merge")
+        await db_run(state, db_set_task_status, conn, task_id, "done")
+        await broadcast(state, {"type": EVT_TASK_UPDATE, "task_id": task_id, "status": "done"})
+        return
+
+    video_sid = stream_ids.get("video")
+    video_path = work_dir / "video.mkv"
+
+    vid_stream = await db_run(state, lambda c, s: c.execute(
+        "SELECT * FROM streams WHERE id=?", (s,)).fetchone(), conn, video_sid) if video_sid else None
+
+    if vid_stream and vid_stream["status"] == "done":
+        log("INFO", "Video already downloaded — skip")
+    else:
+        log("INFO", f"Downloading video ({video.get('resolution', '?')})...")
+        if video_sid:
+            await db_run(state, db_update_stream, conn, video_sid, status="downloading")
+
+        def _video_progress(p: dict):
+            msg = {
+                "type":        EVT_STREAM_PROGRESS,
+                "task_id":     task_id,
+                "stream_id":   video_sid,
+                "stream_type": "video",
+                "label":       video.get("resolution", ""),
+                **{k: v for k, v in p.items() if v is not None},
+            }
+            state.progress_queue.put_nowait(msg)
+
+        try:
+            ok = await download_video_stream(
+                video["uri"], video_path, duration_sec,
+                _video_progress, state.config.stall_timeout_sec
+            )
+            if ok and video_sid:
+                await db_run(state, db_update_stream, conn, video_sid,
+                             status="done",
+                             size_bytes=video_path.stat().st_size if video_path.exists() else None)
+                await broadcast(state, {"type": EVT_STREAM_UPDATE, "stream_id": video_sid,
+                                        "task_id": task_id, "status": "done"})
+                log("INFO", "Video download complete")
+            elif not ok:
+                raise RuntimeError("ffmpeg returned non-zero for video download")
+        except (StallError, RuntimeError, Exception) as e:
+            if video_sid:
+                await db_run(state, db_update_stream, conn, video_sid,
+                             status="failed", error=str(e))
+            attempts = await db_run(state, db_increment_attempts, conn, task_id)
+            log("ERROR", f"Video failed (attempt {attempts}): {e}")
+            await broadcast(state, {
+                "type": EVT_TASK_ERROR, "task_id": task_id,
+                "error": str(e), "attempt": attempts,
+                "will_retry": attempts < MAX_ATTEMPTS,
+            })
+            if attempts >= MAX_ATTEMPTS:
+                await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+            return
+
+    # ── 8. Download audio tracks ──────────────────────────────────────────────
+    downloaded_audio: list[tuple[Path, dict]] = []
+
+    for i, at in enumerate(audios):
+        sid = stream_ids.get(f"audio_{i}")
+        audio_path = work_dir / f"audio_{i+1}.m4a"
+
+        a_stream = await db_run(state, lambda c, s: c.execute(
+            "SELECT * FROM streams WHERE id=?", (s,)).fetchone(), conn, sid) if sid else None
+
+        if a_stream and a_stream["status"] == "done":
+            log("INFO", f"Audio {i+1} already done — skip")
+            track_name = clean_track_name(at.get("name", f"Audio {i+1}"))
+            downloaded_audio.append((audio_path, {
+                "title":    track_name,
+                "language": lang_from_track_name(at.get("name", "")) or at.get("language"),
+            }))
+            continue
+
+        label = at.get("name", f"Audio {i+1}")
+        log("INFO", f"Downloading audio [{label}]...")
+        if sid:
+            await db_run(state, db_update_stream, conn, sid, status="downloading")
+
+        def _audio_progress(p: dict, _sid=sid, _label=label):
+            msg = {
+                "type":        EVT_STREAM_PROGRESS,
+                "task_id":     task_id,
+                "stream_id":   _sid,
+                "stream_type": "audio",
+                "label":       _label,
+                **{k: v for k, v in p.items() if v is not None},
+            }
+            state.progress_queue.put_nowait(msg)
+
+        try:
+            ok = await download_audio_stream(
+                at["uri"], audio_path, duration_sec,
+                _audio_progress, state.config.stall_timeout_sec
+            )
+            if ok:
+                if sid:
+                    await db_run(state, db_update_stream, conn, sid,
+                                 status="done",
+                                 size_bytes=audio_path.stat().st_size if audio_path.exists() else None)
+                track_name = clean_track_name(label)
+                downloaded_audio.append((audio_path, {
+                    "title":    track_name,
+                    "language": lang_from_track_name(label) or at.get("language"),
+                }))
+                log("INFO", f"Audio [{label}] done")
+            else:
+                if sid:
+                    await db_run(state, db_update_stream, conn, sid,
+                                 status="failed", error="ffmpeg returned non-zero")
+                log("WARN", f"Audio [{label}] failed — will skip from merge")
+        except (StallError, Exception) as e:
+            if sid:
+                await db_run(state, db_update_stream, conn, sid, status="failed", error=str(e))
+            log("WARN", f"Audio [{label}] error (non-fatal, skipping): {e}")
+
+    # ── 9. Merge ──────────────────────────────────────────────────────────────
+    log("INFO", f"Merging {1 + len(downloaded_audio)} streams into MKV...")
+    mkv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ok = await merge_into_mkv(video_path, downloaded_audio, mkv_path)
+    except Exception as e:
+        log("ERROR", f"Merge failed: {e}")
+        attempts = await db_run(state, db_increment_attempts, conn, task_id)
+        await db_run(state, db_set_task_status, conn, task_id,
+                     "failed" if attempts >= MAX_ATTEMPTS else "pending",
+                     error=str(e))
+        return
+
+    if not ok:
+        log("ERROR", "Merge returned failure")
+        attempts = await db_run(state, db_increment_attempts, conn, task_id)
+        await db_run(state, db_set_task_status, conn, task_id,
+                     "failed" if attempts >= MAX_ATTEMPTS else "pending",
+                     error="merge failed")
+        return
+
+    # ── 10. Cleanup ───────────────────────────────────────────────────────────
+    try:
+        shutil.rmtree(work_dir)
+    except Exception as e:
+        log("WARN", f"Could not remove tmp dir: {e}")
+
+    await db_run(state, db_set_task_status, conn, task_id, "done",
+                 mkv_path=str(mkv_path))
+    log("INFO", f"Done → {mkv_path.name}")
+    await broadcast(state, {
+        "type":     EVT_TASK_UPDATE,
+        "task_id":  task_id,
+        "status":   "done",
+        "mkv_path": str(mkv_path),
+    })
+
+
+def item_from_meta(item: dict) -> dict:
+    """Reconstruct the info dict from the DB item row for scaffold()."""
+    import json
+    if item.get("meta_json"):
+        try:
+            return json.loads(item["meta_json"])
+        except Exception:
+            pass
+    return {
+        "id":        item["id"],
+        "kind":      item["kind"],
+        "title_orig": item["title_orig"],
+        "title_ru":  item.get("title_ru"),
+        "year":      item.get("year"),
+        "url":       item["url"],
+        "poster_url": item.get("poster_url"),
+    }
+
+
+async def add_audio_to_task(
+    task_id: int,
+    audio_url: str,
+    label: str | None,
+    state,
+) -> int:
+    """
+    Download an extra audio track and remux it into the existing MKV.
+    Returns the new stream_id.
+    """
+    from .scheduler import db_run
+    from .ws_server import broadcast
+
+    conn   = state.conn
+    config = state.config
+
+    task = await db_run(state, db_get_task, conn, task_id)
+    if not task:
+        raise ValueError(f"Task {task_id} not found")
+    if task["status"] != "done":
+        raise ValueError(f"Task {task_id} is not done (status={task['status']})")
+
+    mkv_path = Path(task["mkv_path"])
+    if not mkv_path.exists():
+        raise FileNotFoundError(f"MKV not found: {mkv_path}")
+
+    work_dir = Path(config.tmp_dir) / f"add_audio_{task_id}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tmp_audio = work_dir / "extra_audio.m4a"
+
+    # Register stream
+    sid = await db_run(state, db_upsert_stream, conn,
+        task_id=task_id, stream_type="audio",
+        label=label or "Extra Audio",
+        lang=lang_from_track_name(label or "") or "und",
+        forced=False, source_url=audio_url,
+        tmp_path=str(tmp_audio),
+    )
+
+    from .db import db_log, db_update_stream
+    await db_run(state, db_update_stream, conn, sid, status="downloading")
+
+    def _progress(p):
+        state.progress_queue.put_nowait({
+            "type": EVT_STREAM_PROGRESS, "task_id": task_id, "stream_id": sid,
+            "stream_type": "audio", "label": label or "Extra Audio",
+            **{k: v for k, v in p.items() if v is not None},
+        })
+
+    ok = await download_audio_stream(audio_url, tmp_audio, None, _progress,
+                                     state.config.stall_timeout_sec)
+    if not ok:
+        await db_run(state, db_update_stream, conn, sid, status="failed",
+                     error="download failed")
+        raise RuntimeError("Audio download failed")
+
+    audio_meta = {
+        "title":    clean_track_name(label or "Extra Audio"),
+        "language": lang_from_track_name(label or ""),
+    }
+    remux_ok = await remux_add_audio(mkv_path, tmp_audio, audio_meta, work_dir)
+    if not remux_ok:
+        await db_run(state, db_update_stream, conn, sid, status="failed",
+                     error="remux failed")
+        raise RuntimeError("Remux failed")
+
+    await db_run(state, db_update_stream, conn, sid, status="done",
+                 size_bytes=tmp_audio.stat().st_size if tmp_audio.exists() else None)
+    await db_run(state, db_log, conn, "INFO",
+                 f"Added audio track [{label}] to {mkv_path.name}", task_id)
+
+    import shutil
+    shutil.rmtree(work_dir, ignore_errors=True)
+    await broadcast(state, {"type": EVT_STREAM_UPDATE, "stream_id": sid,
+                            "task_id": task_id, "status": "done"})
+    return sid
+
+
+async def add_sub_to_task(
+    task_id: int,
+    sub_url: str,
+    lang: str | None,
+    state,
+) -> int:
+    """
+    Download an extra subtitle track and save as a Plex sidecar .srt.
+    Returns the new stream_id.
+    """
+    from .scheduler import db_run
+    from .ws_server import broadcast
+
+    conn   = state.conn
+    config = state.config
+
+    task = await db_run(state, db_get_task, conn, task_id)
+    if not task:
+        raise ValueError(f"Task {task_id} not found")
+
+    guessed_lang = lang or lang_from_sub_url(sub_url)
+
+    # Find out_path (count existing sub tracks in same lang for numbering)
+    existing = await db_run(state, db_get_streams, conn, task_id)
+    same_lang = [s for s in existing if s["stream_type"] == "subtitle" and s["lang"] == guessed_lang]
+    idx = len(same_lang) + 1
+
+    out_stem = Path(config.output_dir) / task["plex_stem"]
+    out_path = out_stem.parent / (
+        f"{out_stem.name}.{guessed_lang}.srt" if idx == 1
+        else f"{out_stem.name}.{guessed_lang}.{idx}.srt"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    sid = await db_run(state, db_upsert_stream, conn,
+        task_id=task_id, stream_type="subtitle",
+        label=guessed_lang, lang=guessed_lang, forced=False,
+        source_url=sub_url, out_path=str(out_path),
+    )
+
+    from .db import db_log, db_update_stream
+    await db_run(state, db_update_stream, conn, sid, status="downloading")
+
+    ok = await download_subtitle_stream(sub_url, out_path, stall_timeout=120)
+    if not ok:
+        await db_run(state, db_update_stream, conn, sid, status="failed",
+                     error="download failed")
+        raise RuntimeError("Subtitle download failed")
+
+    await db_run(state, db_update_stream, conn, sid, status="done",
+                 size_bytes=out_path.stat().st_size if out_path.exists() else None,
+                 out_path=str(out_path))
+    await db_run(state, db_log, conn, "INFO",
+                 f"Added subtitle [{guessed_lang}] → {out_path.name}", task_id)
+
+    await broadcast(state, {"type": EVT_STREAM_UPDATE, "stream_id": sid,
+                            "task_id": task_id, "status": "done"})
+    return sid
