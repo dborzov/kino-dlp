@@ -434,13 +434,21 @@ def select_streams(manifest: dict, config) -> dict:
 # ── Scaffold ───────────────────────────────────────────────────────────────────
 
 def _sanitise(title: str) -> str:
-    t = re.sub(r'\s*:\s*', ' ', title)
-    t = re.sub(r'[;!*"\\|<>?]', '', t)
-    return re.sub(r'\s+', ' ', t).strip()
+    # Colon → space so "Title: Subtitle" keeps the word break.
+    t = title.replace(":", " ")
+    # Whitelist: unicode letters/digits, underscore, space, hyphen. Drops
+    # apostrophes, quotes, commas, dots, parens/brackets/braces, shell
+    # metacharacters, path separators, and any other exotic punctuation.
+    # Parens, brackets and braces in particular would confuse Plex's
+    # (YYYY) / [info] / {tmdb-N} filename conventions.
+    t = re.sub(r"[^\w\s-]", "", t)
+    # Strip edge hyphens/underscores too so filenames can't start with `-`
+    # (which POSIX tools try to parse as a flag).
+    return re.sub(r"\s+", " ", t).strip(" -_")
 
 
 def _dir_name(title: str, year) -> str:
-    clean = _sanitise(title)
+    clean = _sanitise(title) or "Untitled"
     return f"{clean}({year})" if year else clean
 
 
