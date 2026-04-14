@@ -28,6 +28,8 @@ class AppState:
     ws_clients:    set = field(default_factory=set)
     active_tasks:  dict = field(default_factory=dict)  # task_id → worker_id
     worker_count:  int = 0
+    # stream_id → {pct, speed, eta_sec, elapsed_sec, size_bytes}; live, not persisted.
+    stream_progress: dict = field(default_factory=dict)
 
 
 async def db_run(state: AppState, fn, *args, **kwargs):
@@ -139,14 +141,10 @@ async def main(config: Config) -> None:
     from .session import init_session
     from .ws_server import serve_ws
 
-    # Init target site (URL construction in scraper.py, ffmpeg origin header)
+    # Init target site (URL construction in scraper.py, ffmpeg origin header).
+    # server_main has already called Config.validate(), so `website` is non-empty here.
     set_website(config.website)
     set_origin(config.website)
-    if not config.website:
-        print(
-            "[daemon] Warning: `website` is not set in config. Scraping will fail "
-            "until you set it, e.g. `scrap-pub config --set website=https://example.com`."
-        )
 
     # Init DB
     conn = open_db(config.db_path)

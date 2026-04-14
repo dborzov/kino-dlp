@@ -90,6 +90,31 @@ CREATE UNIQUE INDEX idx_streams_task_type_label
 
 Expression indexes work fine — it's only the inline table-level `UNIQUE` that's restricted. This matters because video streams have no `label` (NULL) and we still need to dedupe them.
 
+## Why ETA is computed in `_parse_progress_line`
+
+ETA needs three numbers: `duration_sec` (target), `elapsed_sec` (how far into the media), and `speed` (ffmpeg's x-realtime factor). All three are already parsed out of a single ffmpeg progress line in `_parse_progress_line()`. Computing ETA anywhere else would mean re-deriving those values or carrying them forward through a second function — both are invitations for drift.
+
+So `_parse_progress_line()` returns `eta_sec` directly, and every caller (downloader progress callback → `stream_progress` cache → WebSocket `stream_progress` event → CLI `show`/`list -v` overlay → UI stream row) reads the same field. There is no separate smoothing pass: the value is `(duration - elapsed) / speed`, rounded to int. It's jittery on the first few ticks and stable afterwards, which matches what the user expects from an ffmpeg-style progress display. ETA is `None` when speed is unknown, duration is missing, or the stream is within one second of the end — "almost done" reads better than "0s remaining".
+
+## Why output size is computed on demand, not persisted
+
+`tasks` has no `output_size_bytes` column by design. Two reasons:
+
+1. **Ground truth differs by lifecycle phase.** For a `done` task the MKV file is the final artefact — `os.stat(mkv_path).st_size` is authoritative and the per-stream sizes are stale (tmp files are cleaned on remux). For anything earlier (`pending`/`active`/`failed`), the MKV doesn't exist yet and the only signal is `SUM(streams.size_bytes)`, with a live override from `state.stream_progress[sid].size_bytes` during active downloads. A persisted column would have to be updated at both transitions, and would still be wrong between them.
+2. **Cost is trivial.** `CMD_LIST` already fetches the streams per task for verbose mode; non-verbose fires one extra batched `SELECT task_id, id, size_bytes FROM streams WHERE task_id IN (…)` for the page (O(200) rows). That's cheaper than the write amplification a persisted column would add on every progress tick.
+
+The helper lives in `ws_server._compute_output_size(state, task, streams)` and stamps `output_size_bytes` onto task dicts before replying. It is a computed field, never written back to the DB.
+
+## Why the SQL gate lives server-side
+
+`scrap-pub sql` is a read-only-by-default escape hatch. The safety gate (strip comments, inspect first token, accept only `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`) runs on the **server** inside `ws_server`, not in the CLI. Three reasons:
+
+1. **Defense in depth for LLM agents.** An agent invoking the daemon via raw WebSocket can skip the CLI entirely. If the gate lived in `cli_main.py`, `{"cmd": "sql", "query": "DROP TABLE tasks"}` from a direct WS client would succeed.
+2. **Single SQLite owner.** Every SQL statement runs on `db_executor` through `db_run`, so all writes are funneled through one thread and one connection. Letting the gate run anywhere else would split policy from enforcement.
+3. **Comment-stripping is not optional.** `/* SELECT */ DROP TABLE tasks` and `WITH x AS (...) DELETE FROM tasks` both look like SELECTs to a naive prefix check. The gate strips `--` and `/* */` comments before tokenizing, so it must be a real SQL-aware step, not a shell-side regex.
+
+`--write` is the explicit escape: the CLI prints a warning and the server bypasses the whitelist. DML/DDL is deliberately noisy to use.
+
 ## ffmpeg stall detection
 
 `ffmpeg.run_ffmpeg()` runs ffmpeg with `stderr=PIPE`, parses progress lines (`frame=`, `time=`, `speed=`, `size=`) as they arrive, and maintains a `last_tick` timestamp. A sibling `watchdog` task wakes every 30 seconds and kills the process if `last_tick` is older than `stall_timeout_sec` (default 300s).

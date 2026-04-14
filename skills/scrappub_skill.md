@@ -6,19 +6,31 @@ download content from a kino-style, on-demand video website into a Plex-ready li
 scrap-pub is a generic download pipeline; the user points it at whatever site they want
 via the `website` config key — the daemon itself ships with no default target site.
 
+For direct SQL questions against the queue DB, see the companion skill
+[`scrappub_sql_skill.md`](scrappub_sql_skill.md).
+
 ---
 
 ## Prerequisites
 
-- **scrap-pub daemon running** — start it once and leave it running:
+- **scrap-pub daemon running** — start it once and leave it running. After a
+  one-time `uv pip install -e .` the console script is on `$PATH`:
   ```bash
-  uv run python -m scrap_pub.daemon.server_main
+  scrap-pub-server
   ```
+  The daemon validates its config at boot and exits with code **2** if
+  anything critical is missing (unset `website`, bad URL scheme, unwritable
+  output/tmp/db paths, port collisions). A missing cookies file is only a
+  warning — the daemon starts anyway and downloads will fail clearly until
+  you upload one.
 - **Valid session cookies** — read at startup from the Netscape `cookies.txt`
   file at `~/.config/scrap-pub/cookies.txt` (same format yt-dlp uses). If
   cookies expire, export a fresh file from the browser and run
   `scrap-pub cookies FILE`.
 - **ffmpeg installed** — required for HLS download and MKV merge.
+
+On NTFS mounts where `.venv` shebangs can't be executed, prefix every command
+with `uv run` (e.g. `uv run scrap-pub status`).
 
 ---
 
@@ -29,36 +41,78 @@ running before any CLI command will work.
 
 ```bash
 # Check daemon health
-uv run python -m scrap_pub.daemon.cli_main status
+scrap-pub status
 
 # Enqueue a movie or specific episode (URLs match the site configured via `website`)
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/121639/s0e1"
+scrap-pub enqueue "https://example.com/item/view/121639/s0e1"
 
 # Enqueue one episode of a series
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/122266/s1e1"
+scrap-pub enqueue "https://example.com/item/view/122266/s1e1"
 
 # Enqueue all episodes in a series
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/122266"
+scrap-pub enqueue "https://example.com/item/view/122266"
 
-# Check queue
-uv run python -m scrap_pub.daemon.cli_main list
-uv run python -m scrap_pub.daemon.cli_main list --status pending
-uv run python -m scrap_pub.daemon.cli_main list --status active
+# Inspect the queue
+scrap-pub list                                    # most recent 50
+scrap-pub list --status pending
+scrap-pub list --status active
+scrap-pub list --since week --kind movie -v       # time-windowed + per-stream progress
+scrap-pub list --since today --status failed --json
+scrap-pub show 42                                 # full detail for one task
 
 # Watch logs in real time
-uv run python -m scrap_pub.daemon.cli_main logs --follow
-uv run python -m scrap_pub.daemon.cli_main logs --task 42 --follow
+scrap-pub logs --follow
+scrap-pub logs --task 42 --follow
 
-# Retry a failed task
-uv run python -m scrap_pub.daemon.cli_main retry 42
+# Retry a failed task (clears completed_at; next claim sets a fresh started_at)
+scrap-pub retry 42
 
 # Skip a task (won't be downloaded)
-uv run python -m scrap_pub.daemon.cli_main skip 42
+scrap-pub skip 42
 
 # Pause / resume all workers
-uv run python -m scrap_pub.daemon.cli_main pause
-uv run python -m scrap_pub.daemon.cli_main resume
+scrap-pub pause
+scrap-pub resume
 ```
+
+### Time filters
+
+`--since`, `--until`, and `--completed-since` accept human-friendly specs:
+`today`, `yesterday`, `week`, `month`, `7d`, `24h`, `30m`, or an ISO
+timestamp. Pending/active/failed tasks are always included in the web UI view
+regardless of window (`include_unfinished=true`), so you never lose sight of
+in-flight work.
+
+### Task detail — `scrap-pub show`
+
+```bash
+scrap-pub show 42
+```
+
+Prints:
+
+- id, status, kind, title/stem
+- `enqueued_at`, `started_at`, `completed_at` (absolute + relative)
+- attempts, output size, mkv path, last error (wrapped)
+- when the task is still active: per-stream progress bars with `%`, ETA, speed, size
+
+Add `--json` for a machine-readable reply.
+
+### Ad-hoc SQL — `scrap-pub sql`
+
+`scrap-pub sql` is a read-only-by-default escape hatch for structured
+questions about the queue. It runs through the daemon (single SQLite owner)
+and enforces a server-side whitelist: only `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`
+are allowed unless you pass `--write`.
+
+```bash
+scrap-pub sql "SELECT id, status, enqueued_at FROM tasks ORDER BY id DESC LIMIT 10"
+scrap-pub sql "SELECT COUNT(*) FROM tasks GROUP BY status" --json
+scrap-pub sql "UPDATE tasks SET status='pending' WHERE id=42" --write
+```
+
+See [`scrappub_sql_skill.md`](scrappub_sql_skill.md) for the schema reference
+and a recipe collection.
 
 ---
 
@@ -83,7 +137,7 @@ Kino-style target sites use browser-impersonation cookies that expire periodical
 When expired:
 - All active tasks are automatically paused
 - `scrap-pub status` shows `cookie_ok: false`
-- The web UI shows a red "Session expired" banner
+- The web UI shows a red "Session expired" banner and an error toast
 
 **Cookies are stored as a Netscape `cookies.txt` file** (the same format yt-dlp,
 curl, and wget use) at `~/.config/scrap-pub/cookies.txt` by default.
@@ -97,7 +151,7 @@ curl, and wget use) at `~/.config/scrap-pub/cookies.txt` by default.
 3. With the target site open, click the extension → **Export** → save the file.
 4. Load it into the daemon:
    ```bash
-   uv run python -m scrap_pub.daemon.cli_main cookies ~/Downloads/site_cookies.txt
+   scrap-pub cookies ~/Downloads/site_cookies.txt
    ```
 
 The file must contain: `_identity`, `token`, `_csrf`, `PHPSESSID`, `cf_clearance`.
@@ -110,18 +164,20 @@ the error flag, and resumes workers automatically.
 
 ```bash
 # Show current config
-uv run python -m scrap_pub.daemon.cli_main config
+scrap-pub config
 
 # Common changes
-uv run python -m scrap_pub.daemon.cli_main config --set concurrency=4
-uv run python -m scrap_pub.daemon.cli_main config --set video_quality=highest
-uv run python -m scrap_pub.daemon.cli_main config --set output_dir="/path/to/plex/library"
+scrap-pub config --set concurrency=4
+scrap-pub config --set video_quality=highest
+scrap-pub config --set output_dir="/path/to/plex/library"
+scrap-pub config --set website="https://example.com"
 ```
 
 ### Config keys
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `website` | `""` | Base URL of the target site. **Required** — daemon refuses to start without it. |
 | `output_dir` | `<project>/output` | Where Plex-ready MKVs are written |
 | `tmp_dir` | `<project>/tmp` | Working directory for ffmpeg (cleaned on task done) |
 | `concurrency` | `2` | Parallel download workers |
@@ -166,11 +222,11 @@ Naming follows Plex media naming conventions (see `docs/spec.md → Output struc
 ### Add an extra audio track to an existing MKV
 
 ```bash
-# 1. Get the task ID
-uv run python -m scrap_pub.daemon.cli_main list --status done
+# 1. Find the task
+scrap-pub list --status done --since month
 
 # 2. Queue the extra audio download (provide the HLS audio .m3u8 URL)
-uv run python -m scrap_pub.daemon.cli_main add-audio 42 "https://cdn.../audio_fra.m3u8" --label "Français"
+scrap-pub add-audio 42 "https://cdn.../audio_fra.m3u8" --label "Français"
 ```
 
 The audio track is downloaded and remuxed into the existing MKV (stream-copy, no re-encode).
@@ -178,7 +234,7 @@ The audio track is downloaded and remuxed into the existing MKV (stream-copy, no
 ### Add a subtitle sidecar
 
 ```bash
-uv run python -m scrap_pub.daemon.cli_main add-sub 42 "https://cdn.../sub.vtt" --lang fra
+scrap-pub add-sub 42 "https://cdn.../sub.vtt" --lang fra
 ```
 
 ---
@@ -203,18 +259,27 @@ async def cmd(payload):
 asyncio.run(cmd({"cmd": "status"}))
 asyncio.run(cmd({"cmd": "enqueue", "url": "https://example.com/item/view/121639/s0e1"}))
 asyncio.run(cmd({"cmd": "list", "status": "pending", "limit": 20}))
+asyncio.run(cmd({"cmd": "list", "verbose": True, "since": "2026-04-01T00:00:00+00:00"}))
+asyncio.run(cmd({"cmd": "get",  "task_id": 42}))
+asyncio.run(cmd({"cmd": "sql",  "query": "SELECT id, status FROM tasks ORDER BY id DESC LIMIT 5"}))
 ```
 
 **Push events** — server broadcasts to all connected clients:
 ```json
 {"type": "daemon_status",   "paused": false, "active_workers": 2, "queue_depth": 5}
-{"type": "stream_progress", "task_id": 42, "stream_type": "video", "pct": 67.3, "speed": 3.4}
+{"type": "stream_progress", "task_id": 42, "stream_type": "video", "pct": 67.3, "speed": 3.4, "eta_sec": 120, "size_bytes": 412000000}
 {"type": "task_update",     "task_id": 42, "status": "done", "mkv_path": "..."}
 {"type": "cookie_error",    "msg": "Session expired — upload new cookies to resume."}
 {"type": "log",             "task_id": 42, "level": "INFO", "msg": "...", "ts": "..."}
 ```
 
 On connect, the server immediately pushes `daemon_status` and the last 50 log lines.
+
+Key reply extensions for `list`/`get`:
+
+- `task.output_size_bytes` — computed on the fly (mkv stat for `done`, sum of streams otherwise)
+- `task.enqueued_at` / `started_at` / `completed_at` — ISO-8601 UTC
+- `streams_by_task` (verbose list only) — `{task_id: [stream_dict, …]}` with live `pct`/`speed`/`eta_sec`/`size_bytes` overlaid from the in-memory progress cache
 
 ---
 
@@ -224,40 +289,68 @@ On connect, the server immediately pushes `daemon_status` and the last 50 log li
 
 ```bash
 # Enqueue
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/121639/s0e1"
+scrap-pub enqueue "https://example.com/item/view/121639/s0e1"
 # → "Enqueued 1 task(s): [3]"
 
-# Poll until done (or watch logs)
-uv run python -m scrap_pub.daemon.cli_main logs --task 3 --follow
+# Poll with show (shows live progress %, ETA, output size)
+scrap-pub show 3
+
+# Or watch logs
+scrap-pub logs --task 3 --follow
 ```
 
 ### Batch-enqueue a full TV series
 
 ```bash
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/122266"
+scrap-pub enqueue "https://example.com/item/view/122266"
 # → "Enqueued 8 task(s): [4, 5, 6, 7, 8, 9, 10, 11]"
 
-uv run python -m scrap_pub.daemon.cli_main list --status pending
+scrap-pub list --status pending
+scrap-pub list --since today --verbose
 ```
 
 ### Handle cookie expiry
 
 ```bash
-uv run python -m scrap_pub.daemon.cli_main status
+scrap-pub status
 # → cookie_ok: false
 
 # Re-export cookies.txt from the browser, then:
-uv run python -m scrap_pub.daemon.cli_main cookies ~/Downloads/site_cookies.txt
+scrap-pub cookies ~/Downloads/site_cookies.txt
 # → daemon auto-resumes
 ```
 
 ### Recover a failed task
 
 ```bash
-uv run python -m scrap_pub.daemon.cli_main list --status failed
-# → Task #5: status=failed [stall after 305s, attempt 3/3]
+scrap-pub list --status failed --since week
+# → #5  ✗  Some Movie(2025)  failed  2h ago  [stall after 305s, attempt 3/3]
 
-uv run python -m scrap_pub.daemon.cli_main retry 5
+scrap-pub retry 5
 # → Task 5 reset to pending
+
+scrap-pub show 5
+# → completed_at is cleared; the task will get a fresh started_at on next claim
 ```
 
+### Audit disk usage and long-running downloads
+
+```bash
+# Largest finished tasks this month
+scrap-pub sql "
+  SELECT id, plex_stem, mkv_path
+  FROM tasks
+  WHERE status='done' AND completed_at >= date('now','-30 days')
+  ORDER BY id DESC LIMIT 20
+"
+
+# Tasks that started more than 2 hours ago but are still active (likely stuck)
+scrap-pub sql "
+  SELECT id, plex_stem, started_at
+  FROM tasks
+  WHERE status='active' AND started_at < datetime('now','-2 hours')
+"
+```
+
+See [`scrappub_sql_skill.md`](scrappub_sql_skill.md) for more recipes and the
+full schema reference.

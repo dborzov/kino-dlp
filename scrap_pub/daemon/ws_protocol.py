@@ -15,7 +15,10 @@ Server → client (push events):
 
 Client → server (commands):
   enqueue         — add item by URL
-  list            — list tasks
+  list            — list tasks (supports status/kind/since/verbose filters)
+  get             — fetch one task (with its streams + live progress overlay)
+  sql             — run a SELECT/WITH/PRAGMA/EXPLAIN against the DB (read-only
+                    by default; write=true required for DML)
   logs            — fetch log lines
   status          — get daemon status
   retry           — retry failed task
@@ -48,6 +51,8 @@ EVT_REPLY           = "reply"
 
 CMD_ENQUEUE    = "enqueue"
 CMD_LIST       = "list"
+CMD_GET        = "get"
+CMD_SQL        = "sql"
 CMD_LOGS       = "logs"
 CMD_STATUS     = "status"
 CMD_RETRY      = "retry"

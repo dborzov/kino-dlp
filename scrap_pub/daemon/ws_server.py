@@ -7,6 +7,8 @@ broadcast(state, msg) — send a JSON message to all connected clients
 
 import asyncio
 import json
+import re
+from pathlib import Path
 
 import websockets
 import websockets.asyncio.server
@@ -18,12 +20,14 @@ from .ws_protocol import (
     CMD_CONFIG_SET,
     CMD_COOKIES,
     CMD_ENQUEUE,
+    CMD_GET,
     CMD_LIST,
     CMD_LOGS,
     CMD_PAUSE,
     CMD_RESUME,
     CMD_RETRY,
     CMD_SKIP,
+    CMD_SQL,
     CMD_STATUS,
     EVT_DAEMON_STATUS,
     EVT_LOG,
@@ -32,6 +36,54 @@ from .ws_protocol import (
     reply_err,
     reply_ok,
 )
+
+# SQL safety gate: these are the only leading keywords allowed when `write=false`.
+# Comments are stripped before the first-token check.
+_SQL_READONLY_PREFIXES = ("SELECT", "WITH", "PRAGMA", "EXPLAIN")
+_SQL_MAX_ROWS_DEFAULT = 1000
+_SQL_COMMENT_RE = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
+
+
+def _sql_is_readonly(query: str) -> bool:
+    """Return True iff `query`'s first non-whitespace keyword is in the allow-list."""
+    stripped = _SQL_COMMENT_RE.sub(" ", query).lstrip()
+    if not stripped:
+        return False
+    first = stripped.split(None, 1)[0].upper()
+    return first in _SQL_READONLY_PREFIXES
+
+
+def _compute_output_size(state, task: dict, streams: list[dict]) -> int:
+    """Best-effort disk footprint for a task, in bytes.
+
+    For `done` tasks the final MKV is ground truth — ephemeral per-stream files
+    may have been cleaned up during remux. For everything else, sum the per-stream
+    sizes, preferring the live in-memory ticker over the DB's last-settled value.
+    """
+    if task.get("status") == "done" and task.get("mkv_path"):
+        try:
+            p = Path(task["mkv_path"])
+            if p.exists():
+                return p.stat().st_size
+        except OSError:
+            pass
+    total = 0
+    for s in streams:
+        sid = s.get("id")
+        live = state.stream_progress.get(sid, {}).get("size_bytes") if sid is not None else None
+        total += live if live is not None else (s.get("size_bytes") or 0)
+    return total
+
+
+def _overlay_stream_progress(state, stream: dict) -> dict:
+    """Return a copy of `stream` with any live progress fields merged on top."""
+    sid = stream.get("id")
+    live = state.stream_progress.get(sid) if sid is not None else None
+    if not live:
+        return stream
+    merged = dict(stream)
+    merged.update(live)
+    return merged
 
 
 async def broadcast(state, msg: dict) -> None:
@@ -109,6 +161,7 @@ async def dispatch(msg: dict, state) -> dict:
     """Route a client command to the appropriate handler."""
     from .db import (
         db_get_logs,
+        db_get_streams,
         db_get_task,
         db_is_cookie_error,
         db_is_paused,
@@ -139,11 +192,108 @@ async def dispatch(msg: dict, state) -> dict:
 
     # ── list ──────────────────────────────────────────────────────────────────
     elif cmd == CMD_LIST:
-        status = msg.get("status")
-        limit  = int(msg.get("limit", 50))
-        offset = int(msg.get("offset", 0))
-        tasks  = await db_run(state, db_list_tasks, state.conn, status, limit, offset)
-        return reply_ok(cmd, tasks=tasks)
+        status          = msg.get("status")
+        limit           = int(msg.get("limit", 50))
+        offset          = int(msg.get("offset", 0))
+        kind            = msg.get("kind")
+        since           = msg.get("since")             # ISO timestamp, client parses humans
+        until           = msg.get("until")
+        completed_since = msg.get("completed_since")
+        include_unfinished = bool(msg.get("include_unfinished", False))
+        verbose         = bool(msg.get("verbose", False))
+
+        tasks = await db_run(
+            state, db_list_tasks, state.conn, status, limit, offset,
+            kind=kind,
+            enqueued_after=since,
+            enqueued_before=until,
+            completed_after=completed_since,
+            include_unfinished=include_unfinished,
+        )
+
+        # Attach per-task stream rollup so the UI and CLI can show output size
+        # without a second round-trip. Verbose callers also get the stream list.
+        streams_by_task: dict[int, list[dict]] = {}
+        for t in tasks:
+            streams = await db_run(state, db_get_streams, state.conn, t["id"])
+            streams = [_overlay_stream_progress(state, s) for s in streams]
+            t["output_size_bytes"] = _compute_output_size(state, t, streams)
+            if verbose:
+                streams_by_task[t["id"]] = streams
+
+        reply_kwargs: dict = {"tasks": tasks}
+        if verbose:
+            reply_kwargs["streams_by_task"] = streams_by_task
+        return reply_ok(cmd, **reply_kwargs)
+
+    # ── get (single task + streams + output size) ─────────────────────────────
+    elif cmd == CMD_GET:
+        task_id = msg.get("task_id")
+        if task_id is None:
+            return reply_err(cmd, "missing 'task_id'")
+        try:
+            tid = int(task_id)
+        except (TypeError, ValueError):
+            return reply_err(cmd, f"task_id must be int (got {task_id!r})")
+        task = await db_run(state, db_get_task, state.conn, tid)
+        if not task:
+            return reply_err(cmd, f"task {tid} not found")
+        streams = await db_run(state, db_get_streams, state.conn, tid)
+        streams = [_overlay_stream_progress(state, s) for s in streams]
+        task["output_size_bytes"] = _compute_output_size(state, task, streams)
+        return reply_ok(cmd, task=task, streams=streams)
+
+    # ── sql (read-only by default) ────────────────────────────────────────────
+    elif cmd == CMD_SQL:
+        query = msg.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return reply_err(cmd, "missing 'query'")
+        params = msg.get("params") or []
+        if not isinstance(params, (list, tuple)):
+            return reply_err(cmd, "'params' must be a list")
+        write = bool(msg.get("write", False))
+        max_rows = int(msg.get("max_rows", _SQL_MAX_ROWS_DEFAULT))
+        if max_rows < 1:
+            max_rows = _SQL_MAX_ROWS_DEFAULT
+
+        if not write and not _sql_is_readonly(query):
+            return reply_err(
+                cmd,
+                "refusing to run a non-SELECT/WITH/PRAGMA/EXPLAIN statement without "
+                "--write. Pass write=true (CLI: --write) to allow DML/DDL.",
+            )
+
+        def _run_sql(conn):
+            cur = conn.execute(query, tuple(params))
+            if cur.description is None:
+                # No result set (INSERT/UPDATE/DELETE/DDL)
+                conn.commit()
+                return {
+                    "columns": [],
+                    "rows":    [],
+                    "rowcount": cur.rowcount,
+                    "truncated": False,
+                }
+            cols = [d[0] for d in cur.description]
+            rows: list[list] = []
+            truncated = False
+            for i, r in enumerate(cur):
+                if i >= max_rows:
+                    truncated = True
+                    break
+                rows.append(list(r))
+            return {
+                "columns": cols,
+                "rows":    rows,
+                "rowcount": len(rows),
+                "truncated": truncated,
+            }
+
+        try:
+            result = await db_run(state, _run_sql, state.conn)
+        except Exception as e:
+            return reply_err(cmd, f"sqlite error: {e}")
+        return reply_ok(cmd, **result)
 
     # ── logs ──────────────────────────────────────────────────────────────────
     elif cmd == CMD_LOGS:

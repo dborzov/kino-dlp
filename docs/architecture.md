@@ -58,7 +58,11 @@ Workers coordinate via asyncio primitives:
 - `pause_event: asyncio.Event` — set = running, clear = paused
 - `shutdown_event: asyncio.Event` — set on SIGTERM/SIGINT
 
-All shared state lives in `AppState` (`scheduler.py`), passed by reference to every handler.
+All shared state lives in `AppState` (`scheduler.py`), passed by reference to every handler. This includes `stream_progress: dict[int, dict]` — a live per-stream cache keyed by `stream_id` with `pct`, `speed`, `eta_sec`, `elapsed_sec`, `size_bytes`. The downloader updates it on every ffmpeg progress tick, and `CMD_LIST` / `CMD_GET` overlay it onto stream dicts in their replies so the UI and CLI see live numbers without a DB round-trip. Entries are popped when the stream reaches a terminal status.
+
+## Startup validation gate
+
+`server_main.py` calls `Config.validate()` immediately after `Config.load()`. It returns `(errors, warnings)`; any error (unset/bad `website`, unwritable `output_dir` / `tmp_dir` / `db_path.parent`, bad concurrency, port collision, out-of-range ports) prints to stderr and exits with code **2** before any thread or socket is created. Warnings (e.g. missing `cookies_path`) print to stderr and the daemon continues — the first download will fail clearly with a cookie error.
 
 ## Module map
 
@@ -122,8 +126,10 @@ CREATE TABLE tasks (
     mkv_path      TEXT,
     UNIQUE(item_id, season, episode)
 );
-CREATE INDEX idx_tasks_status ON tasks(status);
-CREATE INDEX idx_tasks_item   ON tasks(item_id);
+CREATE INDEX idx_tasks_status       ON tasks(status);
+CREATE INDEX idx_tasks_item         ON tasks(item_id);
+CREATE INDEX idx_tasks_enqueued_at  ON tasks(enqueued_at);
+CREATE INDEX idx_tasks_completed_at ON tasks(completed_at);
 
 -- One row per stream track. Enables granular resume and post-hoc additions.
 CREATE TABLE streams (

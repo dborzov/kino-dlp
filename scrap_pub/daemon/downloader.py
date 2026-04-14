@@ -47,6 +47,26 @@ from .ws_protocol import EVT_STREAM_PROGRESS, EVT_STREAM_UPDATE, EVT_TASK_ERROR,
 
 MAX_ATTEMPTS = 3
 
+# Fields captured into AppState.stream_progress so CLI list/show can read live
+# telemetry without hitting the DB on every ffmpeg tick.
+_LIVE_FIELDS = ("pct", "speed", "eta_sec", "elapsed_sec", "size_bytes")
+
+
+def _emit_progress(state, msg: dict) -> None:
+    """Broadcast a stream-progress event and mirror it into the live cache."""
+    sid = msg.get("stream_id")
+    if sid is not None:
+        live = {k: msg[k] for k in _LIVE_FIELDS if k in msg}
+        if live:
+            state.stream_progress[sid] = live
+    state.progress_queue.put_nowait(msg)
+
+
+def _clear_live(state, stream_id) -> None:
+    """Drop the live-progress cache entry once a stream settles."""
+    if stream_id is not None:
+        state.stream_progress.pop(stream_id, None)
+
 
 async def download_task(task: dict, state) -> None:
     """
@@ -256,7 +276,7 @@ async def download_task(task: dict, state) -> None:
                 "label":       video.get("resolution", ""),
                 **{k: v for k, v in p.items() if v is not None},
             }
-            state.progress_queue.put_nowait(msg)
+            _emit_progress(state, msg)
 
         try:
             ok = await download_video_stream(
@@ -267,6 +287,7 @@ async def download_task(task: dict, state) -> None:
                 await db_run(state, db_update_stream, conn, video_sid,
                              status="done",
                              size_bytes=video_path.stat().st_size if video_path.exists() else None)
+                _clear_live(state, video_sid)
                 await broadcast(state, {"type": EVT_STREAM_UPDATE, "stream_id": video_sid,
                                         "task_id": task_id, "status": "done"})
                 log("INFO", "Video download complete")
@@ -276,6 +297,7 @@ async def download_task(task: dict, state) -> None:
             if video_sid:
                 await db_run(state, db_update_stream, conn, video_sid,
                              status="failed", error=str(e))
+                _clear_live(state, video_sid)
             attempts = await db_run(state, db_increment_attempts, conn, task_id)
             log("ERROR", f"Video failed (attempt {attempts}): {e}")
             await broadcast(state, {
@@ -320,7 +342,7 @@ async def download_task(task: dict, state) -> None:
                 "label":       _label,
                 **{k: v for k, v in p.items() if v is not None},
             }
-            state.progress_queue.put_nowait(msg)
+            _emit_progress(state, msg)
 
         try:
             ok = await download_audio_stream(
@@ -332,6 +354,7 @@ async def download_task(task: dict, state) -> None:
                     await db_run(state, db_update_stream, conn, sid,
                                  status="done",
                                  size_bytes=audio_path.stat().st_size if audio_path.exists() else None)
+                    _clear_live(state, sid)
                 track_name = clean_track_name(label)
                 downloaded_audio.append((audio_path, {
                     "title":    track_name,
@@ -342,10 +365,12 @@ async def download_task(task: dict, state) -> None:
                 if sid:
                     await db_run(state, db_update_stream, conn, sid,
                                  status="failed", error="ffmpeg returned non-zero")
+                    _clear_live(state, sid)
                 log("WARN", f"Audio [{label}] failed — will skip from merge")
         except (StallError, Exception) as e:
             if sid:
                 await db_run(state, db_update_stream, conn, sid, status="failed", error=str(e))
+                _clear_live(state, sid)
             log("WARN", f"Audio [{label}] error (non-fatal, skipping): {e}")
 
     # ── 9. Merge ──────────────────────────────────────────────────────────────
@@ -449,7 +474,7 @@ async def add_audio_to_task(
     await db_run(state, db_update_stream, conn, sid, status="downloading")
 
     def _progress(p):
-        state.progress_queue.put_nowait({
+        _emit_progress(state, {
             "type": EVT_STREAM_PROGRESS, "task_id": task_id, "stream_id": sid,
             "stream_type": "audio", "label": label or "Extra Audio",
             **{k: v for k, v in p.items() if v is not None},
@@ -460,6 +485,7 @@ async def add_audio_to_task(
     if not ok:
         await db_run(state, db_update_stream, conn, sid, status="failed",
                      error="download failed")
+        _clear_live(state, sid)
         raise RuntimeError("Audio download failed")
 
     audio_meta = {
@@ -470,10 +496,12 @@ async def add_audio_to_task(
     if not remux_ok:
         await db_run(state, db_update_stream, conn, sid, status="failed",
                      error="remux failed")
+        _clear_live(state, sid)
         raise RuntimeError("Remux failed")
 
     await db_run(state, db_update_stream, conn, sid, status="done",
                  size_bytes=tmp_audio.stat().st_size if tmp_audio.exists() else None)
+    _clear_live(state, sid)
     await db_run(state, db_log, conn, "INFO",
                  f"Added audio track [{label}] to {mkv_path.name}", task_id)
 

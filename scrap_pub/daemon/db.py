@@ -48,8 +48,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     mkv_path        TEXT,
     UNIQUE(item_id, season, episode)
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_item   ON tasks(item_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status      ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_item        ON tasks(item_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_enqueued_at ON tasks(enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_at ON tasks(completed_at);
 
 CREATE TABLE IF NOT EXISTS streams (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,24 +200,36 @@ def db_set_task_status(
     error: str | None = None,
     mkv_path: str | None = None,
 ) -> None:
-    updates = {"status": status, "last_error": error}
-    if status == "done":
-        updates["completed_at"] = _now()
-        if mkv_path:
-            updates["mkv_path"] = mkv_path
+    # Terminal states all stamp completed_at so the task row alone tells the story
+    # of when it most recently finished, without the caller needing to consult logs.
+    completed_at = _now() if status in ("done", "failed", "skipped") else None
     conn.execute("""
         UPDATE tasks SET status=:status, last_error=:last_error,
             completed_at=COALESCE(:completed_at, completed_at),
             mkv_path=COALESCE(:mkv_path, mkv_path)
         WHERE id=:id
-    """, {**updates, "id": task_id, "completed_at": updates.get("completed_at"), "mkv_path": mkv_path})
+    """, {
+        "status": status,
+        "last_error": error,
+        "completed_at": completed_at,
+        "mkv_path": mkv_path,
+        "id": task_id,
+    })
     conn.commit()
 
 
 def db_increment_attempts(conn: sqlite3.Connection, task_id: int) -> int:
     """Increment task attempts and set status back to pending. Returns new attempt count."""
+    # Retry resets started_at and completed_at so the next claim gives a fresh
+    # "last time started" and the old completion timestamp doesn't linger.
     conn.execute("""
-        UPDATE tasks SET status='pending', attempts=attempts+1, started_at=NULL WHERE id=?
+        UPDATE tasks
+        SET status='pending',
+            attempts=attempts+1,
+            started_at=NULL,
+            completed_at=NULL,
+            last_error=NULL
+        WHERE id=?
     """, (task_id,))
     conn.commit()
     row = conn.execute("SELECT attempts FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -227,17 +241,53 @@ def db_list_tasks(
     status: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    *,
+    kind: str | None = None,
+    enqueued_after: str | None = None,
+    enqueued_before: str | None = None,
+    completed_after: str | None = None,
+    include_unfinished: bool = False,
 ) -> list[dict]:
+    clauses: list[str] = []
+    params: dict = {}
     if status:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (status, limit, offset)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        ).fetchall()
+        clauses.append("status = :status")
+        params["status"] = status
+    if kind:
+        clauses.append("kind = :kind")
+        params["kind"] = kind
+
+    time_clauses: list[str] = []
+    if enqueued_after:
+        time_clauses.append("enqueued_at >= :enqueued_after")
+        params["enqueued_after"] = enqueued_after
+    if enqueued_before:
+        time_clauses.append("enqueued_at < :enqueued_before")
+        params["enqueued_before"] = enqueued_before
+    if completed_after:
+        time_clauses.append("completed_at >= :completed_after")
+        params["completed_after"] = completed_after
+
+    if time_clauses:
+        # `include_unfinished`: always keep pending/active/failed in the result so a
+        # time-windowed web UI view never hides an in-flight download just because it
+        # was enqueued outside the window.
+        if include_unfinished:
+            combined = (
+                "((" + " AND ".join(time_clauses) + ")"
+                " OR status IN ('pending','active','failed'))"
+            )
+            clauses.append(combined)
+        else:
+            clauses.extend(time_clauses)
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params["limit"] = limit
+    params["offset"] = offset
+    rows = conn.execute(
+        f"SELECT * FROM tasks{where} ORDER BY id DESC LIMIT :limit OFFSET :offset",
+        params,
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

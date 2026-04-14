@@ -51,8 +51,8 @@ class StallError(RuntimeError):
 def _parse_progress_line(line: str, duration_sec: int | None) -> dict | None:
     """
     Parse a single ffmpeg stderr line for progress information.
-    Returns a dict with elapsed_sec, pct, speed, size_bytes, or None if no
-    time= token is found on this line.
+    Returns a dict with elapsed_sec, pct, speed, size_bytes, eta_sec, or None
+    if no time= token is found on this line.
     """
     m = re.search(r'time=(\d+):(\d{2}):(\d{2})(?:\.(\d+))?', line)
     if not m:
@@ -63,11 +63,18 @@ def _parse_progress_line(line: str, duration_sec: int | None) -> dict | None:
         pct = min(99.0, elapsed / duration_sec * 100)
     speed_m = re.search(r'speed=\s*([\d.]+)x', line)
     size_m  = re.search(r'size=\s*(\d+)kB', line)
+    speed = float(speed_m.group(1)) if speed_m else None
+    # ETA is deliberately unsmoothed — plan.md §1 — just (remaining / speed).
+    # `None` when speed is unknown or the stream is within a second of the end.
+    eta_sec: int | None = None
+    if duration_sec and speed and speed > 0 and elapsed < duration_sec:
+        eta_sec = max(0, int((duration_sec - elapsed) / speed))
     return {
         "elapsed_sec": elapsed,
         "pct":         pct,
-        "speed":       float(speed_m.group(1)) if speed_m else None,
+        "speed":       speed,
         "size_bytes":  int(size_m.group(1)) * 1024 if size_m else None,
+        "eta_sec":     eta_sec,
     }
 
 

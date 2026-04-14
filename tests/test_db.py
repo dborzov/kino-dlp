@@ -6,6 +6,7 @@ from scrap_pub.daemon.db import (
     db_claim_next_task,
     db_get_logs,
     db_get_task,
+    db_increment_attempts,
     db_insert_task,
     db_is_cookie_error,
     db_is_paused,
@@ -265,6 +266,94 @@ def test_queue_summary_empty(conn):
     assert summary["active"]  == 0
     assert summary["done"]    == 0
     assert summary["failed"]  == 0
+
+
+# ── list filters + timestamps ─────────────────────────────────────────────────
+
+
+def _insert_named(conn, item_id: str, *, kind: str = "movie") -> int:
+    db_upsert_item(conn, {**_item(item_id), "kind": kind})
+    return db_insert_task(conn, item_id=item_id, kind=kind,
+                          season=0 if kind == "movie" else 1,
+                          episode=1,
+                          episode_title=None, media_id=f"m{item_id}",
+                          plex_stem=f"X{item_id}/X{item_id}")
+
+
+def test_list_tasks_kind_filter(conn):
+    _insert_named(conn, "1", kind="movie")
+    _insert_named(conn, "2", kind="episode")
+    _insert_named(conn, "3", kind="episode")
+    movies = db_list_tasks(conn, kind="movie")
+    episodes = db_list_tasks(conn, kind="episode")
+    assert len(movies) == 1
+    assert len(episodes) == 2
+    assert all(t["kind"] == "episode" for t in episodes)
+
+
+def test_list_tasks_since_filter(conn):
+    tid = _insert_named(conn, "1")
+    # Force this task's enqueued_at to the distant past.
+    conn.execute("UPDATE tasks SET enqueued_at='2000-01-01T00:00:00+00:00' WHERE id=?", (tid,))
+    conn.commit()
+    _insert_named(conn, "2")  # "now"
+    recent = db_list_tasks(conn, enqueued_after="2020-01-01T00:00:00+00:00")
+    assert len(recent) == 1
+    assert recent[0]["item_id"] == "2"
+
+
+def test_list_tasks_include_unfinished_overrides_window(conn):
+    # A pending task enqueued long ago should still appear when include_unfinished=True.
+    tid = _insert_named(conn, "1")
+    conn.execute("UPDATE tasks SET enqueued_at='2000-01-01T00:00:00+00:00' WHERE id=?", (tid,))
+    conn.commit()
+    rows = db_list_tasks(
+        conn,
+        enqueued_after="2020-01-01T00:00:00+00:00",
+        include_unfinished=True,
+    )
+    assert any(t["id"] == tid for t in rows)
+
+
+def test_failed_sets_completed_at(conn):
+    tid = _insert_named(conn, "1")
+    db_set_task_status(conn, tid, "failed", error="boom")
+    task = db_get_task(conn, tid)
+    assert task["status"] == "failed"
+    assert task["completed_at"] is not None
+    assert task["last_error"] == "boom"
+
+
+def test_skipped_sets_completed_at(conn):
+    tid = _insert_named(conn, "1")
+    db_set_task_status(conn, tid, "skipped")
+    task = db_get_task(conn, tid)
+    assert task["completed_at"] is not None
+
+
+def test_retry_clears_completed_at(conn):
+    tid = _insert_named(conn, "1")
+    db_set_task_status(conn, tid, "failed", error="boom")
+    assert db_get_task(conn, tid)["completed_at"] is not None
+
+    db_increment_attempts(conn, tid)
+    task = db_get_task(conn, tid)
+    assert task["status"] == "pending"
+    assert task["completed_at"] is None
+    assert task["started_at"] is None
+    assert task["last_error"] is None
+    assert task["attempts"] == 1
+
+
+def test_retry_then_claim_sets_fresh_started_at(conn):
+    tid = _insert_named(conn, "1")
+    db_set_task_status(conn, tid, "failed", error="boom")
+    db_increment_attempts(conn, tid)
+    claimed = db_claim_next_task(conn)
+    assert claimed is not None
+    assert claimed["id"] == tid
+    assert claimed["started_at"] is not None
+    assert claimed["completed_at"] is None
 
 
 def test_queue_summary_counts(conn):

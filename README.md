@@ -41,8 +41,13 @@ otherwise).
 ```bash
 git clone https://github.com/yourusername/scrap-pub.git
 cd scrap-pub
-uv sync            # creates .venv, installs all dependencies
+uv sync                 # creates .venv, installs all dependencies
+uv pip install -e .     # registers scrap-pub / scrap-pub-server on $PATH
 ```
+
+After the editable install the console scripts `scrap-pub` and
+`scrap-pub-server` resolve via `.venv/bin/`. On NTFS mounts where `.venv`
+shebangs can't be executed, fall back to `uv run scrap-pub …`.
 
 ### Get your cookies
 
@@ -69,7 +74,7 @@ reads them from a **Netscape `cookies.txt`** file — the same format used by
    mv ~/Downloads/site_cookies.txt ~/.config/scrap-pub/cookies.txt
 
    # Option B — hot-reload into a running daemon (validates + auto-resumes)
-   uv run python -m scrap_pub.daemon.cli_main cookies ~/Downloads/site_cookies.txt
+   scrap-pub cookies ~/Downloads/site_cookies.txt
    ```
 
 The file **must** contain all five of these cookies (the daemon rejects uploads
@@ -97,13 +102,19 @@ just re-export and run `scrap-pub cookies FILE` again.
 
 ```bash
 # Start the daemon (runs until Ctrl-C)
-uv run python -m scrap_pub.daemon.server_main
+scrap-pub-server
 
 # Or with a custom config file
-uv run python -m scrap_pub.daemon.server_main --config /path/to/config.json
+scrap-pub-server --config /path/to/config.json
 ```
 
-On first start, a config file is created at `~/.config/scrap-pub/config.json` with defaults.
+On first start, a config file is created at `~/.config/scrap-pub/config.json`
+with defaults. The daemon validates the config at boot and **exits with code
+2** if anything critical is missing or malformed (unset `website`, bad URL
+scheme, unwritable `output_dir`/`tmp_dir`/`db_path`, port collisions, …). The
+missing-cookies case is a warning, not an error — the daemon still starts and
+the UI/CLI prompt you to upload.
+
 If you already dropped `cookies.txt` at `~/.config/scrap-pub/cookies.txt` (see
 [§ Get your cookies](#get-your-cookies)) the daemon is ready to go; otherwise
 open the **web UI** at `http://localhost:8765` → Settings and paste your
@@ -117,36 +128,57 @@ All CLI commands connect to the running daemon via WebSocket.
 
 ```bash
 # Status
-uv run python -m scrap_pub.daemon.cli_main status
+scrap-pub status
 
 # Enqueue downloads (URLs on the target site you configured via `website`)
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/121639/s0e1"  # movie
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/122266/s1e1"  # one episode
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/122266"        # all episodes
+scrap-pub enqueue "https://example.com/item/view/121639/s0e1"   # movie
+scrap-pub enqueue "https://example.com/item/view/122266/s1e1"   # one episode
+scrap-pub enqueue "https://example.com/item/view/122266"        # all episodes
 
 # Monitor
-uv run python -m scrap_pub.daemon.cli_main list
-uv run python -m scrap_pub.daemon.cli_main logs --follow
-uv run python -m scrap_pub.daemon.cli_main logs --task 42 --follow
+scrap-pub list                                 # most recent 50
+scrap-pub list --since week --kind movie -v    # filtered + per-stream progress
+scrap-pub list --status failed --json          # machine-readable
+scrap-pub show 42                              # full detail for a single task
+scrap-pub logs --follow
+scrap-pub logs --task 42 --follow
 
 # Control
-uv run python -m scrap_pub.daemon.cli_main pause
-uv run python -m scrap_pub.daemon.cli_main resume
-uv run python -m scrap_pub.daemon.cli_main retry 42
-uv run python -m scrap_pub.daemon.cli_main skip 42
+scrap-pub pause
+scrap-pub resume
+scrap-pub retry 42
+scrap-pub skip 42
 
 # Cookies — Netscape cookies.txt (yt-dlp format)
-uv run python -m scrap_pub.daemon.cli_main cookies ~/Downloads/site_cookies.txt
+scrap-pub cookies ~/Downloads/site_cookies.txt
+
+# Ad-hoc SQL against the queue DB (read-only by default)
+scrap-pub sql "SELECT id, status, enqueued_at FROM tasks ORDER BY id DESC LIMIT 10"
+scrap-pub sql "SELECT COUNT(*) FROM tasks GROUP BY status" --json
+scrap-pub sql "UPDATE tasks SET status='pending' WHERE id=42" --write
 
 # Config
-uv run python -m scrap_pub.daemon.cli_main config
-uv run python -m scrap_pub.daemon.cli_main config --set concurrency=4
-uv run python -m scrap_pub.daemon.cli_main config --set video_quality=highest
-uv run python -m scrap_pub.daemon.cli_main config --set output_dir="/mnt/plex/movies"
+scrap-pub config
+scrap-pub config --set concurrency=4
+scrap-pub config --set video_quality=highest
+scrap-pub config --set output_dir="/mnt/plex/movies"
 ```
 
-After `uv sync`, entry points are also in `.venv/bin/scrap-pub` and `.venv/bin/scrap-pub-server`.
-On NTFS mounts (`.venv` on Windows drives from Linux), use `uv run python -m ...` instead.
+`scrap-pub list` accepts `--status`, `--kind`, `--since`, `--until`,
+`--completed-since`, `--limit`, `--offset`, `-v/--verbose`, and `--json`. Time
+SPECs are human-friendly: `today`, `yesterday`, `week`, `month`, `7d`, `24h`,
+`30m`, or an ISO timestamp. `scrap-pub show` takes a positional task id and
+prints timestamps, attempts, output size, and (for active tasks) live
+per-stream progress with ETA.
+
+`scrap-pub sql` rejects anything that isn't `SELECT` / `WITH` / `PRAGMA` /
+`EXPLAIN` unless `--write` is passed, and caps results at `--limit` rows
+(default 1000). See [`skills/scrappub_sql_skill.md`](skills/scrappub_sql_skill.md)
+for the schema and recipe collection.
+
+After `uv pip install -e .` the entry points are on `$PATH`. On NTFS mounts
+(`.venv` on Windows drives from Linux), the `.venv` shebangs can't be executed —
+use `uv run scrap-pub …` as a fallback.
 
 ---
 

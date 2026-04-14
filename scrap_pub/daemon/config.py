@@ -97,3 +97,66 @@ class Config:
                 value = [v.strip() for v in value.split(",")]
         setattr(self, key, value)
         self.save()
+
+    def validate(self) -> tuple[list[str], list[str]]:
+        """Sanity-check the config before the daemon starts.
+
+        Returns (errors, warnings). An empty errors list means the daemon can start.
+        Warnings are advisory (e.g. missing cookies file — scrape will fail clearly
+        but nothing blows up at boot).
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        if not self.website:
+            errors.append(
+                "`website` is not set. Point it at your target on-demand site, "
+                "e.g. `scrap-pub config --set website=https://example.com`."
+            )
+        elif not (self.website.startswith("http://") or self.website.startswith("https://")):
+            errors.append(
+                f"`website` must start with http:// or https:// (got {self.website!r})."
+            )
+
+        for label, path, need_parent in (
+            ("output_dir", self.output_dir, False),
+            ("tmp_dir",    self.tmp_dir,    False),
+            ("db_path",    self.db_path,    True),
+        ):
+            target = path.parent if need_parent else path
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                errors.append(f"`{label}` ({target}) is not creatable: {e}")
+                continue
+            # Writability probe: create and remove a temp file
+            probe = target / ".scrap-pub-write-probe"
+            try:
+                probe.write_text("ok")
+                probe.unlink()
+            except Exception as e:
+                errors.append(f"`{label}` ({target}) is not writable: {e}")
+
+        if not self.cookies_path.exists():
+            warnings.append(
+                f"`cookies_path` ({self.cookies_path}) does not exist — "
+                "downloads will fail until you provide one via "
+                "`scrap-pub cookies /path/to/cookies.txt`."
+            )
+
+        if self.concurrency < 1:
+            errors.append(f"`concurrency` must be >= 1 (got {self.concurrency}).")
+        if not (1 <= int(self.http_port) <= 65535):
+            errors.append(f"`http_port` must be 1..65535 (got {self.http_port}).")
+        if not (1 <= int(self.ws_port) <= 65535):
+            errors.append(f"`ws_port` must be 1..65535 (got {self.ws_port}).")
+        if self.http_port == self.ws_port:
+            errors.append(
+                f"`http_port` and `ws_port` must differ (both are {self.http_port})."
+            )
+        if self.stall_timeout_sec < 1:
+            errors.append(
+                f"`stall_timeout_sec` must be >= 1 (got {self.stall_timeout_sec})."
+            )
+
+        return errors, warnings

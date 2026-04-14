@@ -91,3 +91,68 @@ def test_tilde_expansion(tmp_path: Path):
     # output_dir is a Path; after expanduser() it should be absolute
     assert "~" not in str(cfg.output_dir)
     assert str(cfg.output_dir).startswith("/")
+
+
+# ── validate() ────────────────────────────────────────────────────────────────
+
+
+def _good_cfg(tmp_path: Path) -> Config:
+    return Config(
+        website="https://example.com",
+        output_dir=tmp_path / "output",
+        tmp_dir=tmp_path / "tmp",
+        db_path=tmp_path / "db" / "queue.db",
+        cookies_path=tmp_path / "cookies.txt",
+    )
+
+
+def test_validate_ok(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    (tmp_path / "cookies.txt").write_text("# cookies")
+    errors, warnings = cfg.validate()
+    assert errors == []
+    assert warnings == []
+
+
+def test_validate_missing_website(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.website = ""
+    errors, _ = cfg.validate()
+    assert any("website" in e for e in errors)
+
+
+def test_validate_bad_url(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.website = "example.com"  # missing scheme
+    errors, _ = cfg.validate()
+    assert any("http://" in e for e in errors)
+
+
+def test_validate_missing_cookies_is_warning(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    # cookies.txt does not exist — expected warning, not error.
+    errors, warnings = cfg.validate()
+    assert errors == []
+    assert any("cookies_path" in w for w in warnings)
+
+
+def test_validate_bad_concurrency(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.concurrency = 0
+    errors, _ = cfg.validate()
+    assert any("concurrency" in e for e in errors)
+
+
+def test_validate_port_collision(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.http_port = 8000
+    cfg.ws_port = 8000
+    errors, _ = cfg.validate()
+    assert any("differ" in e for e in errors)
+
+
+def test_validate_bad_port_range(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.http_port = 0
+    errors, _ = cfg.validate()
+    assert any("http_port" in e for e in errors)

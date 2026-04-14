@@ -152,8 +152,31 @@ scrap-pub enqueue URL [URL ...]
       https://example.com/item/view/12345/s1e3     → specific episode
       https://example.com/item/view/12345/s0e1     → movie (season=0, episode=1)
 
-scrap-pub list [--status STATUS] [--limit N]
-    List tasks. STATUS: pending | active | done | failed | skipped.
+scrap-pub list [--status STATUS] [--kind K] [--since SPEC] [--until SPEC]
+              [--completed-since SPEC] [--limit N] [--offset N] [-v] [--json]
+    List tasks with optional filters.
+      STATUS : pending | active | done | failed | skipped
+      KIND   : movie | episode
+      SPEC   : today | yesterday | week | month | Nd | Nh | Nm | ISO timestamp
+      -v / --verbose : include per-stream rows with % and ETA under each task
+    Each task row carries `output_size_bytes` computed on demand (mkv stat for
+    `done`, sum of stream sizes otherwise).
+
+scrap-pub show TASK_ID [--json]
+    Print a full detail block for one task: status, timestamps (enqueued /
+    started / completed, with relative time), attempts, last error, output
+    size, and — when the task is still active — per-stream progress bars
+    overlaid with live % / ETA / speed from the in-memory progress cache.
+
+scrap-pub sql "QUERY" [--write] [--json|--csv] [--limit N]
+scrap-pub sql -f FILE [...]
+scrap-pub sql -f - [...]      # read from stdin
+    Run a SQL query against the daemon's SQLite DB through the WebSocket.
+    Read-only by default — only SELECT/WITH/PRAGMA/EXPLAIN are accepted
+    unless --write is passed. Results are capped at --limit rows (default
+    1000); the reply's `truncated` flag indicates when the cap was hit.
+    Exit codes: 0 on success, 2 on safety-gate rejection, 1 on SQLite error.
+    See skills/scrappub_sql_skill.md for the schema and recipes.
 
 scrap-pub logs [--task ID] [--limit N] [--follow]
     Show log entries. --follow streams new lines until Ctrl-C.
@@ -194,10 +217,12 @@ Single port (default `8766`). All messages are JSON.
 | `cmd` | Fields | Description |
 |-------|--------|-------------|
 | `status` | — | Daemon status + queue counts |
-| `list` | `status?`, `limit?`, `offset?` | Task list |
+| `list` | `status?`, `kind?`, `since?`, `until?`, `completed_since?`, `limit?`, `offset?`, `verbose?`, `include_unfinished?` | Task list. Each task carries `output_size_bytes`; `verbose=true` also attaches `streams_by_task` with live progress overlaid. |
+| `get` | `task_id` | Single task with `streams`, live progress overlay, and `output_size_bytes`. Replies `ok: false` if not found. |
+| `sql` | `query`, `params?`, `write?`, `max_rows?` | Run a SQL query. Read-only by default (first-token gate: `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`); set `write: true` to allow DML/DDL. Reply includes `columns`, `rows`, `rowcount`, `truncated`. Row cap defaults to 1000. |
 | `logs` | `task_id?`, `limit?` | Log entries |
 | `enqueue` | `url` | Scrape + create tasks |
-| `retry` | `task_id` | Reset task to pending |
+| `retry` | `task_id` | Reset task to pending (clears `completed_at`) |
 | `skip` | `task_id` | Mark task skipped |
 | `pause` | — | Pause workers |
 | `resume` | — | Resume workers |
@@ -218,12 +243,14 @@ Single port (default `8766`). All messages are JSON.
 
 ```json
 {"type": "daemon_status",   "paused": false, "active_workers": 2, "queue_depth": 5, "cookie_ok": true, "counts": {...}}
-{"type": "stream_progress", "task_id": 42, "stream_id": 7, "stream_type": "video", "pct": 34.2, "speed": 3.4, "size_bytes": 45000000}
+{"type": "stream_progress", "task_id": 42, "stream_id": 7, "stream_type": "video", "pct": 34.2, "speed": 3.4, "eta_sec": 180, "size_bytes": 45000000}
 {"type": "task_update",     "task_id": 42, "status": "done", "mkv_path": "..."}
 {"type": "stream_update",   "stream_id": 7, "status": "done", "size_bytes": 92000000}
 {"type": "cookie_error",    "msg": "Session expired — upload new cookies to resume."}
 {"type": "log",             "task_id": 42, "level": "INFO", "msg": "...", "ts": "..."}
 ```
+
+`stream_progress.eta_sec` is `(duration_sec - elapsed_sec) / speed`, unsmoothed. It is `null` when speed is unknown or the stream is within a second of the end. The same value is attached to stream dicts surfaced via `list verbose` / `get`.
 
 On connect the server immediately sends `daemon_status` + the last 50 global log lines.
 

@@ -23,11 +23,12 @@ Docs live in `docs/`. Each file covers one concern. Start here; jump to what you
 | [plex_naming.md](plex_naming.md) | Plex media naming conventions (cached copy of Plex support article) |
 | [local_plex_files.md](local_plex_files.md) | Plex local media assets article (cached) |
 
-## Agent skill guide
+## Agent skill guides
 
 Not in `docs/` but worth knowing:
 
 - [`skills/scrappub_skill.md`](../skills/scrappub_skill.md) — How an AI agent (Claude Code, OpenClaw) uses the daemon as a tool
+- [`skills/scrappub_sql_skill.md`](../skills/scrappub_sql_skill.md) — Schema reference and recipes for `scrap-pub sql`, the read-only-by-default SQL escape hatch
 
 ## Architecture decision records
 

@@ -155,9 +155,65 @@ progress.done::-webkit-progress-value { background: var(--green); }
 
 /* ── Empty state ── */
 .empty { text-align: center; color: var(--muted); padding: 40px; font-size: .9rem; }
+
+/* ── Filter bar ── */
+.filter-bar { display: flex; gap: 6px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
+.filter-bar label { font-size: .78rem; color: var(--muted); }
+.filter-bar select {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 8px; border-radius: 4px; font-family: inherit; font-size: .78rem;
+}
+.filter-bar button.chip {
+  background: var(--surface); color: var(--muted);
+  border: 1px solid var(--border); padding: 3px 10px;
+  border-radius: 12px; font-size: .72rem;
+}
+.filter-bar button.chip.on {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+
+/* ── Task row extras ── */
+.task-size {
+  font-size: .72rem; color: var(--muted); font-variant-numeric: tabular-nums;
+  background: #22263a; padding: 2px 7px; border-radius: 3px;
+}
+.task-time { font-size: .72rem; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.stream-pct { width: 38px; color: var(--text-dim); text-align: right;
+              font-variant-numeric: tabular-nums; font-size: .72rem; }
+.stream-eta { width: 44px; color: var(--muted); text-align: right;
+              font-variant-numeric: tabular-nums; font-size: .72rem; }
+
+/* ── Toast stack ── */
+#toast-stack {
+  position: fixed; top: 60px; right: 16px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 8px; max-width: 420px;
+}
+.toast {
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); color: var(--text);
+  padding: 10px 14px; border-radius: 5px; font-size: .82rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,.4);
+  display: flex; gap: 10px; align-items: flex-start;
+  animation: toast-in .2s ease-out;
+}
+.toast.error { border-left-color: var(--red); }
+.toast.warn  { border-left-color: var(--yellow); }
+.toast.info  { border-left-color: var(--accent); }
+.toast .toast-msg { flex: 1; word-break: break-word; }
+.toast .toast-x {
+  background: none; color: var(--muted); padding: 0 4px;
+  font-size: 1rem; line-height: 1; cursor: pointer;
+}
+.toast .toast-x:hover { color: var(--text); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
 </style>
 </head>
 <body>
+
+<div id="toast-stack"></div>
 
 <header>
   <span class="ws-dot" id="ws-dot"></span>
@@ -197,6 +253,20 @@ progress.done::-webkit-progress-value { background: var(--green); }
 
 <!-- ══ Done ══════════════════════════════════════════════════════════ -->
 <div id="tab-done" class="tab-content">
+  <div class="filter-bar">
+    <label>Since:</label>
+    <button class="chip" data-since="today"     onclick="setSinceFilter('today')">Today</button>
+    <button class="chip on" data-since="week"   onclick="setSinceFilter('week')">Week</button>
+    <button class="chip" data-since="month"     onclick="setSinceFilter('month')">Month</button>
+    <button class="chip" data-since=""          onclick="setSinceFilter('')">All</button>
+    <span style="width:12px"></span>
+    <label>Kind:</label>
+    <select id="filter-kind" onchange="loadTasks()">
+      <option value="">all</option>
+      <option value="movie">movie</option>
+      <option value="episode">episode</option>
+    </select>
+  </div>
   <div class="section-title">Done</div>
   <div class="task-list" id="done-list"></div>
   <div class="section-title" style="margin-top:16px">Failed</div>
@@ -297,22 +367,61 @@ const state = {
   paused: false,
   cookieOk: true,
   workers: 0,
+  filter: { since: 'week', kind: '' },
+  reconnectToast: null,
 };
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 const id = x => document.getElementById(x);
 function fmtBytes(b) {
   if (!b) return '';
-  if (b < 1024*1024) return (b/1024).toFixed(0) + ' KB';
-  return (b/1024/1024).toFixed(1) + ' MB';
+  const kb = 1024, mb = kb*1024, gb = mb*1024;
+  if (b < mb) return (b/kb).toFixed(0) + ' KB';
+  if (b < gb) return (b/mb).toFixed(1) + ' MB';
+  return (b/gb).toFixed(2) + ' GB';
 }
 function fmtTime(ts) {
   if (!ts) return '';
   return new Date(ts).toLocaleTimeString('en', {hour:'2-digit', minute:'2-digit'});
 }
+function fmtRelTime(iso) {
+  if (!iso) return '';
+  const t = new Date(iso);
+  if (isNaN(t)) return '';
+  const s = Math.round((Date.now() - t.getTime()) / 1000);
+  if (s < 0)     return 'just now';
+  if (s < 60)    return `${s}s ago`;
+  if (s < 3600)  return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+function fmtEta(sec) {
+  if (sec == null) return '';
+  const s = Math.max(0, Math.floor(sec));
+  if (s < 60)   return '<1m';
+  if (s < 3600) return `${Math.floor(s/60)}m`;
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return m ? `${h}h${m}m` : `${h}h`;
+}
 function escHtml(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Toasts ─────────────────────────────────────────────────────────────────────
+function showToast(msg, level = 'info', opts = {}) {
+  const stack = id('toast-stack');
+  if (!stack) return null;
+  const el = document.createElement('div');
+  el.className = `toast ${level}`;
+  el.innerHTML = `<span class="toast-msg"></span><button class="toast-x">×</button>`;
+  el.querySelector('.toast-msg').textContent = msg;
+  el.querySelector('.toast-x').onclick = () => el.remove();
+  stack.appendChild(el);
+  if (!opts.sticky && level !== 'error') {
+    setTimeout(() => el.remove(), 8000);
+  }
+  return el;
 }
 
 // ── Tab navigation ─────────────────────────────────────────────────────────────
@@ -337,11 +446,15 @@ function connect() {
   ws.onopen = () => {
     id('ws-dot').classList.add('ok');
     clearTimeout(wsReconnectTimer);
-    sendCmd({cmd: 'list', limit: 200});
+    if (state.reconnectToast) { state.reconnectToast.remove(); state.reconnectToast = null; }
+    loadTasks();
   };
 
   ws.onclose = () => {
     id('ws-dot').classList.remove('ok');
+    if (!state.reconnectToast) {
+      state.reconnectToast = showToast('Disconnected — reconnecting…', 'warn', {sticky: true});
+    }
     wsReconnectTimer = setTimeout(connect, 3000);
   };
 
@@ -412,6 +525,8 @@ function handleStreamUpdate(msg) {
 }
 
 function handleTaskError(msg) {
+  const note = `Task ${msg.task_id} failed: ${msg.error}`;
+  showToast(note, 'error');
   appendLog({
     level: 'ERROR',
     ts: new Date().toISOString(),
@@ -425,15 +540,25 @@ function handleCookieError(msg) {
   id('cookie-warn').style.display = '';
   id('cookie-status').textContent = '⚠ EXPIRED';
   id('cookie-status').className   = 'cookie-status-fail';
+  showToast(msg.msg || 'Session cookies expired — workers paused', 'error');
   appendLog({level:'ERROR', ts: new Date().toISOString(), task_id: null, msg: msg.msg});
 }
 
 function handleReply(msg) {
   if (!msg.ok) {
+    const label = msg.cmd ? `${msg.cmd}: ` : '';
+    showToast(`${label}${msg.error || 'unknown error'}`, 'error');
     console.warn('Reply error:', msg);
     return;
   }
   if (msg.cmd === 'list' && msg.tasks) {
+    // Merge streams_by_task into state.streams so cards can render live progress.
+    const sbt = msg.streams_by_task || {};
+    for (const [tid, arr] of Object.entries(sbt)) {
+      (arr || []).forEach(s => {
+        state.streams[s.id] = { ...(state.streams[s.id] || {}), ...s, task_id: +tid };
+      });
+    }
     msg.tasks.forEach(t => { state.tasks[t.id] = t; });
     renderPendingList();
     renderActiveList();
@@ -441,7 +566,8 @@ function handleReply(msg) {
   }
   if (msg.cmd === 'enqueue') {
     id('enqueue-url').value = '';
-    sendCmd({cmd: 'list', limit: 200});
+    showToast(`Enqueued ${msg.enqueued || 0} task(s)`, 'info');
+    loadTasks();
   }
 }
 
@@ -450,6 +576,16 @@ function taskLabel(t) {
   const stem = t.plex_stem || '';
   const leaf = stem.split('/').pop() || `Task #${t.id}`;
   return escHtml(leaf);
+}
+
+function metaHTML(t) {
+  const rel  = fmtRelTime(t.completed_at || t.started_at || t.enqueued_at);
+  const ts   = t.completed_at || t.started_at || t.enqueued_at || '';
+  const size = fmtBytes(t.output_size_bytes);
+  return `
+    ${rel ? `<span class="task-time" title="${escHtml(ts)}">${rel}</span>` : ''}
+    ${size ? `<span class="task-size">${size}</span>` : ''}
+  `;
 }
 
 function renderPendingList() {
@@ -461,6 +597,7 @@ function renderPendingList() {
       <div class="task-card" id="task-${t.id}">
         <div class="task-header">
           <span class="task-title">${taskLabel(t)}</span>
+          ${metaHTML(t)}
           <span class="badge pending">pending</span>
           <div class="task-actions">
             <button class="btn-ghost btn-sm" onclick="skipTask(${t.id})">Skip</button>
@@ -497,8 +634,8 @@ function renderDoneList() {
       <div class="task-card">
         <div class="task-header">
           <span class="task-title">${taskLabel(t)}</span>
+          ${metaHTML(t)}
           <span class="badge done">done</span>
-          <span class="task-meta">${fmtTime(t.completed_at)}</span>
         </div>
       </div>
     `).join('');
@@ -508,6 +645,7 @@ function renderDoneList() {
       <div class="task-card">
         <div class="task-header">
           <span class="task-title">${taskLabel(t)}</span>
+          ${metaHTML(t)}
           <span class="badge failed">failed</span>
           <span class="task-meta" title="${escHtml(t.last_error || '')}">${escHtml((t.last_error || '').slice(0,60))}</span>
           <button class="btn-ghost btn-sm" onclick="retryTask(${t.id})">Retry</button>
@@ -528,6 +666,7 @@ function taskCardHTML(t) {
     <div class="task-card" id="task-${t.id}">
       <div class="task-header">
         <span class="task-title">${taskLabel(t)}</span>
+        ${metaHTML(t)}
         <span class="badge ${t.status}">${t.status}</span>
         <div class="task-actions">
           <button class="btn-ghost btn-sm" onclick="viewLogs(${t.id})">Logs</button>
@@ -539,10 +678,12 @@ function taskCardHTML(t) {
 }
 
 function streamRowHTML(s) {
-  const pct     = s.pct ?? 0;
+  const pct     = s.pct ?? s.progress_pct ?? 0;
   const isDone  = s.status === 'done';
   const speed   = s.speed  ? `${s.speed.toFixed(1)}x`  : '';
   const size    = s.size_bytes ? fmtBytes(s.size_bytes) : '';
+  const eta     = isDone ? '✓' : fmtEta(s.eta_sec);
+  const pctLbl  = (pct || pct === 0) ? `${Math.floor(pct)}%` : '';
   const typeLbl = (s.stream_type || '').slice(0, 5);
   const langLbl = s.lang ? `[${s.lang.toUpperCase()}]` : '';
   const label   = escHtml((s.label || '').replace(/^\d+\.\s*/, '').slice(0, 40));
@@ -553,7 +694,9 @@ function streamRowHTML(s) {
       <div class="stream-progress-wrap">
         <progress class="${isDone?'done':''}" value="${pct}" max="100"></progress>
       </div>
-      <span class="stream-speed">${isDone ? '✓' : speed}</span>
+      <span class="stream-pct">${pctLbl}</span>
+      <span class="stream-eta">${eta}</span>
+      <span class="stream-speed">${isDone ? '' : speed}</span>
       <span class="stream-size">${size}</span>
     </div>
   `;
@@ -561,7 +704,23 @@ function streamRowHTML(s) {
 
 // ── Load all tasks ─────────────────────────────────────────────────────────────
 function loadTasks() {
-  sendCmd({cmd: 'list', limit: 200});
+  const payload = { cmd: 'list', limit: 200, verbose: true, include_unfinished: true };
+  const kindSel = id('filter-kind');
+  if (kindSel && kindSel.value) payload.kind = kindSel.value;
+  else if (state.filter.kind)   payload.kind = state.filter.kind;
+  if (state.filter.since)       payload.since = state.filter.since;
+  sendCmd(payload);
+}
+
+function setSinceFilter(spec) {
+  state.filter.since = spec;
+  document.querySelectorAll('.filter-bar button.chip').forEach(b => {
+    b.classList.toggle('on', b.dataset.since === spec);
+  });
+  // Drop tasks that may be filtered out by the new window so the UI doesn't
+  // retain stale rows from the previous query.
+  state.tasks = {};
+  loadTasks();
 }
 
 // ── Log handling ──────────────────────────────────────────────────────────────

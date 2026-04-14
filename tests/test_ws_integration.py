@@ -37,8 +37,8 @@ def db(tmp_path):
 @pytest.fixture
 async def state(db, tmp_path):
     """Minimal AppState with a real DB and isolated config (no global config pollution)."""
-    from concurrent.futures import ThreadPoolExecutor
     import json
+    from concurrent.futures import ThreadPoolExecutor
 
     cfg_file = tmp_path / "config.json"
     cfg_file.write_text(json.dumps({
@@ -301,3 +301,187 @@ async def test_enqueue_missing_url(ws_server):
     reply = await _cmd(url, {"cmd": "enqueue", "url": ""})
     assert reply["ok"] is False
     assert "url" in reply["error"]
+
+
+# ── CMD_GET ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_task_returns_task_and_streams(ws_server):
+    from scrap_pub.daemon.db import db_upsert_stream
+
+    state, url = ws_server
+    tid = _seed_task(state.conn, item_id="80")
+    db_upsert_stream(
+        state.conn, task_id=tid, stream_type="video", label=None, lang=None,
+        source_url="https://cdn/video.m3u8",
+    )
+    reply = await _cmd(url, {"cmd": "get", "task_id": tid})
+    assert reply["ok"] is True
+    assert reply["task"]["id"] == tid
+    assert isinstance(reply["streams"], list)
+    assert len(reply["streams"]) == 1
+    assert reply["streams"][0]["stream_type"] == "video"
+
+
+@pytest.mark.asyncio
+async def test_get_task_not_found(ws_server):
+    state, url = ws_server
+    reply = await _cmd(url, {"cmd": "get", "task_id": 99999})
+    assert reply["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_task_overlays_live_progress(ws_server):
+    from scrap_pub.daemon.db import db_upsert_stream
+
+    state, url = ws_server
+    tid = _seed_task(state.conn, item_id="81")
+    sid = db_upsert_stream(
+        state.conn, task_id=tid, stream_type="video", label=None, lang=None,
+        source_url="https://cdn/video.m3u8",
+    )
+    state.stream_progress[sid] = {
+        "pct": 42.0, "speed": 1.5, "eta_sec": 60,
+        "elapsed_sec": 30, "size_bytes": 12345,
+    }
+    reply = await _cmd(url, {"cmd": "get", "task_id": tid})
+    assert reply["ok"] is True
+    s = reply["streams"][0]
+    assert s["pct"] == 42.0
+    assert s["eta_sec"] == 60
+    assert s["size_bytes"] == 12345
+
+
+# ── CMD_LIST extensions ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_verbose_has_streams_by_task(ws_server):
+    from scrap_pub.daemon.db import db_upsert_stream
+
+    state, url = ws_server
+    tid = _seed_task(state.conn, item_id="90")
+    db_upsert_stream(
+        state.conn, task_id=tid, stream_type="video", label=None, lang=None,
+        source_url="https://cdn/v.m3u8",
+    )
+    reply = await _cmd(url, {"cmd": "list", "verbose": True})
+    assert reply["ok"] is True
+    assert "streams_by_task" in reply
+    # JSON dict keys become strings over the wire
+    assert str(tid) in reply["streams_by_task"]
+
+
+@pytest.mark.asyncio
+async def test_list_has_output_size_bytes(ws_server):
+    state, url = ws_server
+    _seed_task(state.conn, item_id="91")
+    reply = await _cmd(url, {"cmd": "list"})
+    assert reply["ok"] is True
+    assert all("output_size_bytes" in t for t in reply["tasks"])
+
+
+@pytest.mark.asyncio
+async def test_list_kind_filter(ws_server):
+    state, url = ws_server
+    _seed_task(state.conn, item_id="92", kind="movie", season=0, episode=1)
+    _seed_task(state.conn, item_id="93", kind="episode", season=1, episode=1)
+    reply = await _cmd(url, {"cmd": "list", "kind": "episode"})
+    assert reply["ok"] is True
+    assert len(reply["tasks"]) == 1
+    assert reply["tasks"][0]["kind"] == "episode"
+
+
+# ── CMD_SQL ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sql_select_ok(ws_server):
+    state, url = ws_server
+    _seed_task(state.conn, item_id="100")
+    reply = await _cmd(url, {
+        "cmd": "sql",
+        "query": "SELECT id, status FROM tasks ORDER BY id",
+    })
+    assert reply["ok"] is True
+    assert reply["columns"] == ["id", "status"]
+    assert len(reply["rows"]) == 1
+    assert reply["rows"][0][1] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sql_select_with_params(ws_server):
+    state, url = ws_server
+    tid = _seed_task(state.conn, item_id="101")
+    reply = await _cmd(url, {
+        "cmd": "sql",
+        "query": "SELECT id FROM tasks WHERE id = ?",
+        "params": [tid],
+    })
+    assert reply["ok"] is True
+    assert reply["rows"] == [[tid]]
+
+
+@pytest.mark.asyncio
+async def test_sql_rejects_write_by_default(ws_server):
+    state, url = ws_server
+    _seed_task(state.conn, item_id="102")
+    reply = await _cmd(url, {
+        "cmd": "sql",
+        "query": "DELETE FROM tasks",
+    })
+    assert reply["ok"] is False
+    # Safety gate should have refused before execution.
+    row = state.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+    assert row[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_sql_rejects_drop_even_with_comment(ws_server):
+    state, url = ws_server
+    reply = await _cmd(url, {
+        "cmd": "sql",
+        "query": "/* SELECT */ DROP TABLE tasks",
+    })
+    assert reply["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_sql_write_allowed_with_flag(ws_server):
+    state, url = ws_server
+    tid = _seed_task(state.conn, item_id="103")
+    reply = await _cmd(url, {
+        "cmd":   "sql",
+        "query": "UPDATE tasks SET status='skipped' WHERE id=?",
+        "params": [tid],
+        "write": True,
+    })
+    assert reply["ok"] is True
+    assert reply["rowcount"] == 1
+    row = state.conn.execute(
+        "SELECT status FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert row[0] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_sql_row_cap_truncates(ws_server):
+    state, url = ws_server
+    for i in range(5):
+        _seed_task(state.conn, item_id=f"2{i:02d}")
+    reply = await _cmd(url, {
+        "cmd":      "sql",
+        "query":    "SELECT id FROM tasks",
+        "max_rows": 2,
+    })
+    assert reply["ok"] is True
+    assert len(reply["rows"]) == 2
+    assert reply["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_sql_rejects_empty_query(ws_server):
+    state, url = ws_server
+    reply = await _cmd(url, {"cmd": "sql", "query": "   "})
+    assert reply["ok"] is False

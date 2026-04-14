@@ -60,6 +60,51 @@ def test_parse_progress_line_no_duration_gives_none_pct():
     assert result["pct"] is None
 
 
+# ── ETA ───────────────────────────────────────────────────────────────────────
+
+
+def test_eta_computed_when_duration_and_speed_present():
+    # 60s elapsed of 300s, at 2.0x → (300-60)/2 = 120s remaining
+    result = _parse_progress_line(
+        "size=1kB time=00:01:00 speed=2.0x", duration_sec=300
+    )
+    assert result is not None
+    assert result["eta_sec"] == 120
+
+
+def test_eta_none_without_speed():
+    result = _parse_progress_line("time=00:01:00", duration_sec=300)
+    assert result is not None
+    assert result["eta_sec"] is None
+
+
+def test_eta_none_without_duration():
+    result = _parse_progress_line(
+        "size=1kB time=00:01:00 speed=1.0x", duration_sec=None
+    )
+    assert result is not None
+    assert result["eta_sec"] is None
+
+
+def test_eta_none_past_end_of_stream():
+    # elapsed >= duration → eta not computed (stream is effectively done)
+    result = _parse_progress_line(
+        "size=1kB time=00:10:00 speed=1.0x", duration_sec=60
+    )
+    assert result is not None
+    assert result["eta_sec"] is None
+
+
+def test_eta_non_negative():
+    # fractional division should still clamp to non-negative int
+    result = _parse_progress_line(
+        "size=1kB time=00:00:59 speed=10.0x", duration_sec=60
+    )
+    assert result is not None
+    assert result["eta_sec"] is not None
+    assert result["eta_sec"] >= 0
+
+
 # ── run_ffmpeg ─────────────────────────────────────────────────────────────────
 
 

@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working rules
+
+- **Never overwrite `~/.config/scrap-pub/config.json`.** It holds the user's
+  real, hand-tuned values (`website`, paths, language lists, concurrency, etc.).
+  When a task requires changing a config value, use `scrap-pub config --set
+  KEY=VALUE` so only that one key is updated and everything else in the file
+  is preserved. Do **not** `Write` the file, do not `cp` a fresh default over
+  it, and do not regenerate it from `Config()` defaults — that silently
+  clobbers custom values and they have to be re-entered by hand.
+- **Default `concurrency` is `2` and must stay `2`.** Higher values are not
+  faster: total throughput is bounded by physical bandwidth, and more parallel
+  sockets make the traffic pattern look obviously non-human to Cloudflare and
+  trigger blocking / challenges. If you find yourself tempted to raise the
+  default because "more is faster", stop — it isn't, and it's actively
+  harmful. Only the user bumps it locally when they know what they're doing.
+
 ## Purpose
 
 `scrap-pub` is a generic download pipeline for kino-style, on-demand video websites. It
@@ -16,14 +32,17 @@ of service.
 
 ## Commands
 
-Use **uv** for all Python tasks. `uv sync` creates `.venv` and installs all deps including
-the package itself in editable mode (entry points available as `.venv/bin/scrap-pub*`).
-
-On NTFS mounts the `.venv` scripts can't be executed directly — always invoke via `uv run`:
+Use **uv** for all Python tasks. `uv sync` creates `.venv` and installs all deps
+including the package itself in editable mode, which registers the `scrap-pub` and
+`scrap-pub-server` console scripts. After a one-time `uv pip install -e .` (or
+`uv tool install .` for a global install) the commands are on `$PATH` and can be
+called directly. On NTFS mounts the `.venv` shebangs can't be executed — fall back
+to `uv run scrap-pub …` instead.
 
 ```bash
 # Install / sync dependencies
 uv sync
+uv pip install -e .          # makes scrap-pub / scrap-pub-server available
 
 # Run tests
 uv run pytest
@@ -34,18 +53,26 @@ uv run pytest tests/test_ws_integration.py -v
 # Lint
 uv run ruff check scrap_pub/ tests/
 
-# Start the daemon
-uv run python -m scrap_pub.daemon.server_main
+# Start the daemon (exits non-zero if the config fails validation)
+scrap-pub-server
 
 # Use the CLI (daemon must be running)
-uv run python -m scrap_pub.daemon.cli_main status
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/..."
-uv run python -m scrap_pub.daemon.cli_main list
+scrap-pub status
+scrap-pub enqueue "https://example.com/item/view/..."
+scrap-pub list --since week --verbose
+scrap-pub show 42
+scrap-pub sql "SELECT id, status FROM tasks ORDER BY id DESC LIMIT 10"
 
 # Install a new package
 uv add <package>          # adds to pyproject.toml + syncs
 uv add --dev <package>    # dev dependency
 ```
+
+`scrap-pub list` accepts `--status`, `--kind`, `--since`, `--until`,
+`--completed-since`, `--offset`, `-v/--verbose`, and `--json`.
+`scrap-pub sql` is read-only by default (only `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`);
+pass `--write` to run DML/DDL. The daemon refuses to start if `website` is
+missing or malformed — see `Config.validate()` in `scrap_pub/daemon/config.py`.
 
 ## Session cookies
 
@@ -60,7 +87,7 @@ The file can be produced with a browser extension ("Get cookies.txt LOCALLY" is 
 one we document). To reload cookies into a running daemon:
 
 ```bash
-uv run python -m scrap_pub.daemon.cli_main cookies /path/to/cookies.txt
+scrap-pub cookies /path/to/cookies.txt
 ```
 
 ## Architecture

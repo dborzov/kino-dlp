@@ -17,9 +17,10 @@ Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and ffmpeg.
 git clone <repo>
 cd scrap-pub
 uv sync                       # creates .venv, installs deps + dev extras + editable package
+uv pip install -e .           # one-time: puts scrap-pub / scrap-pub-server on $PATH
 ```
 
-`uv sync` also installs the CLI entry points at `.venv/bin/scrap-pub` and `.venv/bin/scrap-pub-server`. On NTFS mounts those scripts can't be executed directly — use `uv run python -m scrap_pub.daemon.cli_main …` instead.
+After the editable install the console scripts `scrap-pub` and `scrap-pub-server` resolve via `.venv/bin/` and can be invoked directly. On NTFS mounts the `.venv` shebangs can't be executed — fall back to `uv run scrap-pub …`.
 
 ### Cookies for local testing
 
@@ -40,7 +41,7 @@ wget use) at `~/.config/scrap-pub/cookies.txt`.
    ```bash
    mv ~/Downloads/site_cookies.txt ~/.config/scrap-pub/cookies.txt
    # or, with the daemon running:
-   uv run python -m scrap_pub.daemon.cli_main cookies ~/Downloads/site_cookies.txt
+   scrap-pub cookies ~/Downloads/site_cookies.txt
    ```
 
 The file **must** contain these cookies: `_identity`, `token`, `_csrf`, `PHPSESSID`,
@@ -87,20 +88,30 @@ uv run ruff check --fix scrap_pub/ tests/    # auto-fix
 Tests cover protocol and unit behavior. To verify a real download works you need real cookies.
 
 ```bash
-# 1. start the daemon
-uv run python -m scrap_pub.daemon.server_main
+# 1. start the daemon — validate-fail case should exit 2 cleanly
+scrap-pub config --set website=""   # make it bad on purpose
+scrap-pub-server                    # expect: "`website` is not set ..." and exit 2
+scrap-pub config --set website="https://example.com"
 
-# 2. in another shell — enqueue a cheap item on your configured target site
-uv run python -m scrap_pub.daemon.cli_main enqueue "https://example.com/item/view/121639/s0e1"
+# 2. start the daemon for real
+scrap-pub-server
 
-# 3. watch logs
-uv run python -m scrap_pub.daemon.cli_main logs --follow
+# 3. in another shell — enqueue a cheap item on your configured target site
+scrap-pub enqueue "https://example.com/item/view/121639/s0e1"
 
-# 4. confirm output
+# 4. watch progress — verbose list shows per-stream % and ETA for the active task
+scrap-pub list --since today --verbose
+scrap-pub show 1                       # full detail + timestamps + output size
+scrap-pub logs --follow
+
+# 5. sanity-check the queue with a quick SQL view
+scrap-pub sql "SELECT id, status, enqueued_at, completed_at FROM tasks ORDER BY id DESC LIMIT 5"
+
+# 6. confirm output
 ls ~/output/
 ```
 
-For UI work: open `http://localhost:8765` and exercise each tab while a task runs — progress bars should update live via WebSocket.
+For UI work: open `http://localhost:8765` and exercise each tab while a task runs — progress bars, ETA, and per-task output size should update live via WebSocket. Enqueue an obviously-bad URL to verify the error toast appears (silent failure bug fix).
 
 ---
 
@@ -123,7 +134,7 @@ raw/                        captured browser requests (gitignored)
 
 ## Conventions
 
-- **Run everything through uv** — `uv run python -m …`, never bare `python3`
+- **Use the console scripts** — prefer `scrap-pub`/`scrap-pub-server` after `uv pip install -e .`. For other Python tasks (tests, scripts), use `uv run …`, never bare `python3`.
 - **Add deps with uv** — `uv add <pkg>` / `uv add --dev <pkg>`, never hand-edit `pyproject.toml`
 - **DB access only via `db_run`** — never call `db.*` from an async coroutine directly (see [internals.md § Threading invariant](internals.md#threading-invariant-db-calls-only-on-db_executor))
 - **Forward kwargs via `functools.partial`** — `run_in_executor` drops them otherwise (see [internals.md § `db_run` and `functools.partial`](internals.md#db_run-and-functoolspartial))
