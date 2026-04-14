@@ -1,5 +1,7 @@
 """Tests for scrap_pub.daemon.db — schema, CRUD, and atomic task claim."""
 
+import sqlite3
+
 import pytest
 
 from scrap_pub.daemon.db import (
@@ -101,6 +103,72 @@ def test_insert_task_idempotent(conn):
                           media_id="m1", plex_stem="X/X")
     assert tid1 is not None
     assert tid2 is None
+
+
+def test_insert_task_default_output_dir_is_null(conn):
+    db_upsert_item(conn, _item("1"))
+    tid = db_insert_task(conn, item_id="1", kind="movie",
+                         season=0, episode=1, episode_title=None,
+                         media_id="m1", plex_stem="X/X")
+    task = db_get_task(conn, tid)
+    assert task["output_dir"] is None
+
+
+def test_insert_task_with_output_dir(conn):
+    db_upsert_item(conn, _item("1"))
+    tid = db_insert_task(conn, item_id="1", kind="movie",
+                         season=0, episode=1, episode_title=None,
+                         media_id="m1", plex_stem="X/X",
+                         output_dir="/mnt/plex/Movies")
+    task = db_get_task(conn, tid)
+    assert task["output_dir"] == "/mnt/plex/Movies"
+
+
+def test_migration_adds_output_dir_to_legacy_schema(tmp_path):
+    """A DB created without output_dir picks up the column when re-opened."""
+    db_path = tmp_path / "legacy.db"
+    # Create a pre-migration tasks table (no output_dir).
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("""
+        CREATE TABLE tasks (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id         TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            season          INTEGER NOT NULL DEFAULT 0,
+            episode         INTEGER NOT NULL DEFAULT 0,
+            episode_title   TEXT,
+            media_id        TEXT,
+            plex_stem       TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            enqueued_at     TEXT NOT NULL,
+            started_at      TEXT,
+            completed_at    TEXT,
+            mkv_path        TEXT
+        )
+    """)
+    raw.execute(
+        "INSERT INTO tasks (item_id, kind, enqueued_at, plex_stem) "
+        "VALUES ('legacy', 'movie', '2020-01-01T00:00:00+00:00', 'Old/Old')"
+    )
+    raw.commit()
+    raw.close()
+
+    # Open via open_db() — should ALTER the table and preserve the legacy row.
+    conn = open_db(db_path)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    assert "output_dir" in cols
+
+    row = conn.execute("SELECT item_id, output_dir FROM tasks").fetchone()
+    assert row["item_id"] == "legacy"
+    assert row["output_dir"] is None
+
+    # Running the migration a second time is a no-op (no duplicate column error).
+    conn.close()
+    conn2 = open_db(db_path)
+    assert {r["name"] for r in conn2.execute("PRAGMA table_info(tasks)")} >= {"output_dir"}
+    conn2.close()
 
 
 def test_claim_next_task(conn):

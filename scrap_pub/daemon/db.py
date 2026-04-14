@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     started_at      TEXT,
     completed_at    TEXT,
     mkv_path        TEXT,
+    output_dir      TEXT,
     UNIQUE(item_id, season, episode)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status      ON tasks(status);
@@ -109,7 +110,19 @@ def open_db(db_path: Path) -> sqlite3.Connection:
         if s:
             conn.execute(s)
     conn.commit()
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply lightweight, idempotent schema migrations to an existing DB.
+
+    Only adds nullable columns — safe under WAL and on repeated opens.
+    """
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if "output_dir" not in existing:
+        conn.execute("ALTER TABLE tasks ADD COLUMN output_dir TEXT")
+        conn.commit()
 
 
 def _now() -> str:
@@ -160,13 +173,30 @@ def db_insert_task(
     episode_title: str | None,
     media_id: str | None,
     plex_stem: str | None,
+    output_dir: str | None = None,
 ) -> int | None:
-    """Insert a task row. Returns new id, or None if it already existed."""
+    """Insert a task row. Returns new id, or None if it already existed.
+
+    `output_dir` is an optional per-task override of `config.output_dir`. When
+    NULL the task falls back to the daemon-wide default at download time.
+    """
     cur = conn.execute("""
         INSERT OR IGNORE INTO tasks
-            (item_id, kind, season, episode, episode_title, media_id, plex_stem, enqueued_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (item_id, kind, season, episode, episode_title, media_id, plex_stem, _now()))
+            (item_id, kind, season, episode, episode_title,
+             media_id, plex_stem, output_dir, enqueued_at)
+        VALUES (:item_id, :kind, :season, :episode, :episode_title,
+                :media_id, :plex_stem, :output_dir, :enqueued_at)
+    """, {
+        "item_id":       item_id,
+        "kind":          kind,
+        "season":        season,
+        "episode":       episode,
+        "episode_title": episode_title,
+        "media_id":      media_id,
+        "plex_stem":     plex_stem,
+        "output_dir":    output_dir,
+        "enqueued_at":   _now(),
+    })
     conn.commit()
     if cur.lastrowid and cur.rowcount > 0:
         return cur.lastrowid
