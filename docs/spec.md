@@ -171,7 +171,7 @@ scrap-pub enqueue URL [URL ...] [-o PATH | --output-dir PATH]
         does **not** silently ignore the flag. Missing directories are
         auto-created *only* when the parent exists and is writable.
 
-scrap-pub lookup URL [-e|--episodes] [--json]
+scrap-pub lookup URL [-e|--episodes] [-d|--description] [--json]
     Fetch ONE item URL on the configured target site and print its core
     metadata — Russian title, original-language title, year, and whether
     the item is a movie or a TV show — without enqueueing anything.
@@ -194,10 +194,16 @@ scrap-pub lookup URL [-e|--episodes] [--json]
         being fetched; the structured output still goes to stdout so
         `--json | jq` keeps working.
 
+    -d, --description
+        Also print the synopsis/plot text scraped from the item page
+        (wrapped at ~72 columns). The `description` field is always
+        present in `--json` output regardless of this flag — it only
+        toggles whether the human-readable view renders it.
+
     --json
         Emit the parsed metadata dict as JSON (title_ru, title_orig,
         kind, year, seasons, seasons_data when --episodes was passed,
-        cast, genres, rating/id fields).
+        cast, genres, description, rating/id fields).
 
     `lookup` is LOCAL — it does not talk to the daemon. The only
     prerequisite is a valid cookies file at
@@ -214,6 +220,14 @@ scrap-pub list [--status STATUS] [--kind K] [--since SPEC] [--until SPEC]
       -v / --verbose : include per-stream rows with % and ETA under each task
     Each task row carries `output_size_bytes` computed on demand (mkv stat for
     `done`, sum of stream sizes otherwise).
+
+    Time-spec semantics: `today` and `yesterday` resolve to the user's LOCAL
+    calendar day (midnight local, converted to UTC before the SQLite
+    comparison). `week` / `month` / `Nd` / `Nh` / `Nm` are rolling offsets
+    from the current instant. Specs are parsed by
+    `scrap_pub.daemon.timespec.parse_since`, which the web UI also shares
+    server-side — so the UI's Today/Week/Month chips apply the same
+    semantics as the CLI.
 
 scrap-pub show TASK_ID [--json]
     Print a full detail block for one task: status, timestamps (enqueued /
@@ -446,5 +460,6 @@ Full Plex naming reference: [plex_naming.md](plex_naming.md).
 
 - **Task-level** — existing non-empty `mkv_path` short-circuits the worker
 - **Stream-level** — only `pending` streams are re-downloaded; `done` streams are reused
-- **Scaffold** — `scaffold()` skips already-downloaded posters/thumbnails; always re-writes `.info.json`
+- **Scaffold** — `scaffold()` skips already-downloaded posters/thumbnails. Show-level work (series `show.info.json` + `poster.jpg`) short-circuits entirely when both files already exist on disk, so queueing a second episode of a long-running series does not re-write them. Movie `.info.json` is still rewritten on every run (cheap, avoids drift). The `.info.json` payload now includes a `description` field carrying the synopsis/plot text scraped from the item page.
+- **Per-episode scope** — when an episode URL (`/item/view/ID/sXeY`) is enqueued, both `scrape()` and `scaffold()` narrow their work to *that one episode*: `scrape()` fetches only season X's page (skipping rate-limited walks across every other season), and `scaffold()` only creates `sXeY.info.json` + `sXeY-thumb.jpg`, not metadata for every episode of every season. Enqueueing a show-root URL (no `/sXeY` suffix) still walks every season as before.
 - **Enqueue** — the `UNIQUE(item_id, season, episode)` index dedupes; re-enqueuing an item with the *same* (or no) `--output-dir` is a no-op. Re-enqueuing with a *different* `--output-dir` fails loudly instead of silently ignoring the new path — delete the existing task first.

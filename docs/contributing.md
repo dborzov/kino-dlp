@@ -55,7 +55,7 @@ The file **must** contain these cookies: `_identity`, `token`, `_csrf`, `PHPSESS
 ## Running tests
 
 ```bash
-uv run pytest                          # all tests (~31s, 101 tests)
+uv run pytest                          # all tests
 uv run pytest tests/ -v                # verbose
 uv run pytest tests/test_db.py -v      # one file
 uv run pytest -k "test_enqueue"        # by name
@@ -70,7 +70,14 @@ Test coverage by file:
 | `test_ws_protocol.py` | `encode` / `decode` / `reply` helpers |
 | `test_scraper_names.py` | `_sanitise`, `_dir_name`, `_episode_stem` (no network) |
 | `test_ffmpeg.py` | `_parse_progress_line`, stall detection, process exit codes |
-| `test_ws_integration.py` | Full WS round-trip: real server, real DB, 16 command scenarios |
+| `test_ws_integration.py` | Full WS round-trip: real server, real DB, command scenarios |
+| `test_models.py` | Pydantic model round-trip for `Movie` / `TVSeries` / `Episode` / `Person` |
+| `test_cli_paths.py` | `scrap-pub paths` offline subcommand |
+| `test_downloader_output_root.py` | `task_output_root()` helper + per-task override resolution |
+| `test_output_dir_validation.py` | `validate_task_output_dir`: parent missing, unwritable, low free space |
+| `test_scheduler_db_run.py` | `db_run` / `net_run` kwargs forwarding via `functools.partial` |
+| `test_scaffold_only.py` | Per-episode `scaffold(only=…)` scope + show-level short-circuit + description in `show.info.json` |
+| `test_timespec.py` | `parse_since` local-midnight semantics, rolling offsets, ISO round-trip, invalid specs |
 
 Tests bind the WebSocket server to port 0 (random). See [internals.md § WebSocket server port in the sandbox](internals.md#websocket-server-port-in-the-sandbox).
 

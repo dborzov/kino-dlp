@@ -68,8 +68,9 @@ scrap-pub paths               # prints output/tmp/db/cookies/config/website
 scrap-pub paths output        # just the output dir — for `cd $(scrap-pub paths output)`
 
 # Inspect an item page BEFORE enqueueing (no daemon required)
-scrap-pub lookup "https://example.com/item/view/121936/s0e1"             # title/year/kind
-scrap-pub lookup "https://example.com/item/view/30658/s10e4" --episodes  # + full episode list
+scrap-pub lookup "https://example.com/item/view/121936/s0e1"                 # title/year/kind
+scrap-pub lookup "https://example.com/item/view/30658/s10e4" --episodes      # + full episode list
+scrap-pub lookup "https://example.com/item/view/30658/s10e4" --description   # + synopsis/plot
 
 # Install a new package
 uv add <package>          # adds to pyproject.toml + syncs
@@ -116,6 +117,7 @@ scrap_pub/
     ws_server.py      — serve_ws(), ws_handler(), broadcast(), command dispatch
     server_http.py    — stdlib HTTPServer: GET / → web UI, GET /health → {"ok":true}
     ui.py             — HTML_UI: single-file web UI (5 tabs, per-stream progress bars)
+    timespec.py       — parse_since(): shared human-friendly time-window parser (CLI + daemon)
     server_main.py    — scrap-pub-server entry point
     cli_main.py       — scrap-pub CLI: all subcommands via WebSocket
 tests/
@@ -135,8 +137,26 @@ raw/                  — gitignored: captured browser requests, reference mater
 
 ## Key implementation details
 
-- **`db_run` kwargs**: `run_in_executor` can't forward `**kwargs`. Downloader uses
-  `functools.partial(fn, **kwargs)` to bind them before passing to the executor.
+- **`db_run` / `net_run` kwargs**: `run_in_executor` can't forward `**kwargs`.
+  Callers use `functools.partial(fn, **kwargs)` to bind them before passing
+  to the executor. This is how `ws_server._enqueue_url` and
+  `downloader.download_task` push `only_season=` / `only=(s,e)` into
+  `scrape()` / `scaffold()`.
+- **Per-episode scaffold**: `scaffold()` takes an optional `only=(season,
+  episode)` tuple; `scrape()` takes `only_season`. When an enqueue URL
+  points at `/sXeY`, the full pipeline (scrape → items row → scaffold →
+  task row → downloader scaffold) narrows to that single episode rather
+  than walking every season and emitting metadata for every episode.
+- **Show-level scaffold short-circuit**: `scaffold()` skips re-writing
+  `show.info.json` and re-downloading `poster.jpg` when both already exist.
+  Queueing a second episode of an already-scaffolded series is therefore
+  a pure per-episode operation.
+- **Time-window filters**: `scrap_pub/daemon/timespec.py::parse_since`
+  converts `today` / `yesterday` / `week` / `month` / `Nd|Nh|Nm` / ISO into
+  a UTC ISO-8601 string. Both the CLI (`scrap-pub list --since`) and the
+  daemon's WebSocket `list` handler call it — so the web UI can post raw
+  specs like `today` and get the same semantics. `today`/`yesterday` are
+  LOCAL calendar-day boundaries, not UTC midnight.
 - **Config save path**: `Config._cfg_path` tracks which file was loaded. `save()` and
   `update()` write to that path, not the global default. Tests must use `Config.load(tmp_path)`.
 - **Stream resume**: Downloader checks stream `status` — only `pending` streams are re-downloaded.

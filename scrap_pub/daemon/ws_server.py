@@ -192,13 +192,21 @@ async def dispatch(msg: dict, state) -> dict:
 
     # ── list ──────────────────────────────────────────────────────────────────
     elif cmd == CMD_LIST:
+        from .timespec import parse_since
+
         status          = msg.get("status")
         limit           = int(msg.get("limit", 50))
         offset          = int(msg.get("offset", 0))
         kind            = msg.get("kind")
-        since           = msg.get("since")             # ISO timestamp, client parses humans
-        until           = msg.get("until")
-        completed_since = msg.get("completed_since")
+        # Accept either a pre-parsed UTC ISO timestamp (CLI) or a human spec
+        # like "today"/"week" (web UI). `parse_since` is a no-op on already
+        # parsed ISO strings (it round-trips them through UTC).
+        try:
+            since           = parse_since(msg.get("since"))
+            until           = parse_since(msg.get("until"))
+            completed_since = parse_since(msg.get("completed_since"))
+        except ValueError as e:
+            return reply_err(cmd, str(e))
         include_unfinished = bool(msg.get("include_unfinished", False))
         verbose         = bool(msg.get("verbose", False))
 
@@ -462,8 +470,16 @@ async def _enqueue_url(
     req_season  = int(se.group(1)) if se else None
     req_episode = int(se.group(2)) if se else None
 
-    # Scrape (slow — runs in net executor)
-    info = await net_run(state, scrape, url_full)
+    # Scrape (slow — runs in net executor). When the user named a specific
+    # episode URL, restrict per-season walks to just that one season. A
+    # non-zero season > 0 is the signal; `/s0e1` is the movie sentinel and
+    # should fall through to a normal scrape.
+    import functools
+    only_season_for_scrape = req_season if req_season and req_season > 0 else None
+    info = await net_run(
+        state,
+        functools.partial(scrape, url_full, only_season=only_season_for_scrape),
+    )
 
     # Store item
     await db_run(state, db_upsert_item, state.conn, info)
@@ -486,7 +502,16 @@ async def _enqueue_url(
         )
 
     # Scaffold dirs (poster, thumbnails, info.json) into the EFFECTIVE root.
-    await net_run(state, scaffold, info, effective_root)
+    # If a specific episode was requested, narrow per-episode file creation
+    # to just that one — no point writing s02e08.info.json when the user only
+    # enqueued s03e05.
+    scaffold_only: tuple[int, int] | None = None
+    if req_season is not None and req_episode is not None and req_season > 0:
+        scaffold_only = (req_season, req_episode)
+    await net_run(
+        state,
+        functools.partial(scaffold, info, effective_root, only=scaffold_only),
+    )
 
     title  = canonical_title(info)
     year   = info.get("year")

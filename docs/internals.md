@@ -147,6 +147,74 @@ that landed under the default `~/output` would be ignored by the scanner
 and silently orphaned. `add_sub_to_task` reloads the task row and calls
 `task_output_root(task, config)` just like the initial download path does.
 
+## Scaffold scope: one episode, not the whole season
+
+Early `scaffold()` unconditionally walked every episode of every season
+present in `info["seasons_data"]` and wrote a `.info.json` + `-thumb.jpg`
+for each one. For a single `scrap-pub enqueue URL/s03e05` that meant
+dozens of HTTP fetches and image writes for episodes the user never asked
+for — and every re-enqueue of a neighbour episode repeated the work.
+
+Two companion changes fix this:
+
+1. **`scaffold(info, root, *, only=(season, ep))`** — when `only` is set,
+   the per-episode loop skips every other `(season, episode)` pair. The
+   downloader passes its task's own `(season, episode)` tuple; movies
+   pass `None` (they have no episode tree to walk). `scrape(url, only_season=N)` is the companion: when the caller only needs one
+   episode, we also avoid fetching every *other* season's episode listing
+   over the network, not just skipping them at write time.
+2. **Show-level short-circuit** — before writing `show.info.json` /
+   `poster.jpg`, `scaffold()` checks whether both already exist on disk.
+   If they do, it leaves them untouched. Rationale: once a series has
+   been scaffolded, re-running scaffold for a different episode is
+   redundant work *and* would overwrite any hand-edits the user made to
+   `show.info.json` (episode numbering fixes, translated titles).
+
+Why a presence check instead of a "scaffold-ran" flag in the DB: the
+filesystem is the source of truth for a Plex library. The user can
+delete `show.info.json` to force a re-scaffold, or symlink it in from
+elsewhere — both cases are supported by a dumb `exists()` probe and
+would break if we tracked scaffold state in SQLite.
+
+The `description` field on `show.info.json` is populated from the same
+`#plot` text the individual episode pages use — target sites publish
+the same plot on every episode URL within a series, so the show-level
+description is just the per-episode description reused. `scrape()`
+already visits at least one episode page to resolve the media tree, so
+there's no extra network call.
+
+## Shared `timespec.parse_since`: server-side, not CLI-side
+
+`--since today` / `--since week` exists in two places: the CLI (`scrap-pub list`) and the web UI's Today/Week/Month chips. Both go through
+`CMD_LIST` and both end up in a SQL `WHERE enqueued_at >= ?`. Originally
+the CLI parsed the spec into a UTC ISO string before sending, while the
+UI sent the literal string `today`. The daemon then compared
+`enqueued_at >= 'today'` — which SQLite happily runs lexically, and
+`'2026-04-14T12:00:00+00:00' < 'today'` in ASCII, so the UI's Today chip
+silently returned nothing for tasks completed today.
+
+Fix: a single `scrap_pub.daemon.timespec.parse_since` module, called
+from **both** the CLI (before sending) and `ws_server.CMD_LIST` (on
+receive). The server-side call is the important one — it closes the
+door on any future client that forwards the literal spec. An invalid
+spec raises `ValueError`, which the CLI reports directly and the WS
+server wraps in an error reply.
+
+Two behavioural details worth keeping in mind:
+
+- **`today`/`yesterday` pivot on the user's local calendar day**, not
+  UTC's. A user in PDT expects "today" to mean local 00:00–24:00; with
+  UTC midnight they'd see last night's downloads drop off the list at 5
+  PM local time. The parser calls `datetime.now().astimezone()` to pick
+  up the system timezone, computes local midnight, then converts to UTC
+  for the wire format.
+- **`week`/`month` are rolling offsets**, not calendar boundaries. A
+  literal "past 7 days" is what the chip labels imply. `week` = `now - 7d`, `month` = `now - 30d`.
+
+Output is always a UTC ISO-8601 string so SQLite's lex comparison on
+`enqueued_at` / `completed_at` stays correct regardless of what
+timezone the client is in.
+
 ---
 
 ## SQLite UNIQUE + COALESCE — must be a separate index

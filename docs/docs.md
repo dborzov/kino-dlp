@@ -2,7 +2,7 @@
 
 > One-line summary: map of every doc in this directory and who it's for.
 >
-> Last updated: 2026-04-13
+> Last updated: 2026-04-14
 
 Docs live in `docs/`. Each file covers one concern. Start here; jump to what you need.
 

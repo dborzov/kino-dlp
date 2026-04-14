@@ -23,16 +23,18 @@ Usage:
     scrap-pub add-sub   TASK_ID URL [--lang LANG]
     scrap-pub config [--set KEY=VALUE]
     scrap-pub paths [KEY]           # echo resolved paths from config (no daemon needed)
-    scrap-pub lookup URL [--episodes] [--json]   # fetch + parse one item page (no daemon)
+    scrap-pub lookup URL [--episodes] [-d] [--json]   # fetch + parse one item page (no daemon)
 """
 
 import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .timespec import parse_since as _parse_since
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -74,44 +76,6 @@ _STATUS_ICON = {
     "failed":   "✗",
     "skipped":  "–",
 }
-
-
-def _parse_since(spec: str | None) -> str | None:
-    """Convert a human-friendly time spec into an ISO-8601 UTC string.
-
-    Accepts: today, yesterday, week, month, 7d / 24h / 30m relative offsets,
-    or an ISO date/datetime. Returns None for None/empty input.
-    Raises ValueError on anything unparseable.
-    """
-    if not spec:
-        return None
-    s = spec.strip().lower()
-    now = datetime.now(timezone.utc)
-    if s == "today":
-        t = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif s == "yesterday":
-        t = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    elif s == "week":
-        t = now - timedelta(days=7)
-    elif s == "month":
-        t = now - timedelta(days=30)
-    elif s.endswith("d") and s[:-1].isdigit():
-        t = now - timedelta(days=int(s[:-1]))
-    elif s.endswith("h") and s[:-1].isdigit():
-        t = now - timedelta(hours=int(s[:-1]))
-    elif s.endswith("m") and s[:-1].isdigit():
-        t = now - timedelta(minutes=int(s[:-1]))
-    else:
-        try:
-            t = datetime.fromisoformat(spec)
-        except ValueError as e:
-            raise ValueError(
-                f"invalid time spec {spec!r}: expected today/yesterday/week/month, "
-                "N{d,h,m}, or an ISO date"
-            ) from e
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-    return t.isoformat()
 
 
 def _fmt_eta(seconds: Any) -> str:
@@ -557,7 +521,7 @@ def cmd_paths(args, config) -> None:
 # ── lookup (local, no daemon) ────────────────────────────────────────────────
 
 
-def _print_lookup(info: dict) -> None:
+def _print_lookup(info: dict, *, show_description: bool = False) -> None:
     """Human-readable metadata dump for `scrap-pub lookup`."""
     title_orig = info.get("title_orig")
     title_ru = info.get("title_ru")
@@ -596,6 +560,17 @@ def _print_lookup(info: dict) -> None:
             row("Current", f"S{ins:02d}E{ine:02d}")
 
     row("URL", info.get("url"))
+
+    if show_description:
+        desc = info.get("description")
+        print()
+        if desc:
+            import textwrap
+            print("  Description:")
+            for line in textwrap.wrap(desc, width=72):
+                print(f"    {line}")
+        else:
+            print("  Description: (none found on page)")
 
     # Agent hint — the whole point of this command.
     url = info.get("url") or "<URL>"
@@ -675,7 +650,7 @@ def cmd_lookup(args, config) -> None:
         print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
         return
 
-    _print_lookup(info)
+    _print_lookup(info, show_description=bool(args.description))
 
 
 async def cmd_config(args, config) -> None:
@@ -861,6 +836,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="For TV shows, also fetch every season and list every "
              "episode with its per-episode URL.",
+    )
+    p.add_argument(
+        "-d", "--description",
+        action="store_true",
+        help="Also print the synopsis/plot text scraped from the item page.",
     )
     p.add_argument("--json", action="store_true",
                    help="Emit the parsed metadata dict as JSON.")

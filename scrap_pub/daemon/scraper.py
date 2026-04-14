@@ -167,6 +167,23 @@ def _parse_meta_table(row) -> dict:
     return meta
 
 
+def _parse_description(row) -> str | None:
+    """Return the plot text from the `#plot` tab-pane inside the main content row.
+
+    The site keeps the synopsis in `div.tab-pane#plot`, which is always a
+    descendant of the main content row (never in the "related items" area).
+    Non-breaking spaces in the source are folded into regular spaces.
+    """
+    if not row:
+        return None
+    el = row.select_one("#plot")
+    if not el:
+        return None
+    text = el.get_text(" ", strip=True).replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
 def _parse_poster(row, item_id: str) -> str:
     img = row.select_one("img.item-poster-relative") if row else None
     if img and img.get("src"):
@@ -217,6 +234,7 @@ def scrape(
     arg: str,
     *,
     fetch_episodes: bool = True,
+    only_season: int | None = None,
     progress_cb: Callable[[int, int, int], None] | None = None,
 ) -> dict:
     """
@@ -230,6 +248,11 @@ def scrape(
     request, parses titles/year/kind, and for a series populates just
     result["seasons"] (list of season numbers from the selector buttons).
     No per-season fetches, no seasons_data, no PLAYER_PLAYLIST walk.
+
+    only_season, when set, restricts per-season fetches to that one season —
+    seasons_data ends up with a single key. Used by enqueue when the caller
+    named a specific episode URL, so we avoid re-walking 13 seasons of a
+    long-running show just to download one episode.
 
     progress_cb(done, total, current_season) is invoked before each season
     fetch when fetch_episodes=True and the target is a series. The callback
@@ -257,14 +280,16 @@ def scrape(
     title_ru, title_orig = _parse_og_titles(soup_root)
     poster_url = _parse_poster(row, item_id)
     meta = _parse_meta_table(row)
+    description = _parse_description(row)
     seasons = _parse_seasons(soup_root, item_id)
 
     result = {
-        "id":         item_id,
-        "url":        root_url,
-        "title_ru":   title_ru,
-        "title_orig": title_orig,
-        "poster_url": poster_url,
+        "id":          item_id,
+        "url":         root_url,
+        "title_ru":    title_ru,
+        "title_orig":  title_orig,
+        "poster_url":  poster_url,
+        "description": description,
         **meta,
     }
     # Movie URLs are served as /s0e1, which is a site convention rather
@@ -300,9 +325,19 @@ def scrape(
         # Fast path: caller only wants kind/title/year + season list.
         return result
 
+    if only_season is not None:
+        if only_season not in seasons:
+            raise ValueError(
+                f"season {only_season} not found for item {item_id} "
+                f"(available: {seasons})"
+            )
+        seasons_to_fetch = [only_season]
+    else:
+        seasons_to_fetch = seasons
+
     result["seasons_data"] = {}
-    total = len(seasons)
-    for i, s in enumerate(seasons):
+    total = len(seasons_to_fetch)
+    for i, s in enumerate(seasons_to_fetch):
         if progress_cb is not None:
             progress_cb(i, total, s)
         s_url = _season_url(item_id, s)
@@ -314,8 +349,8 @@ def scrape(
             "audio_tracks": _parse_audio(s_row) if s_row else [],
             "subtitles":    _parse_meta_table(s_row).get("subtitles", []) if s_row else [],
         }
-    if progress_cb is not None:
-        progress_cb(total, total, seasons[-1])
+    if progress_cb is not None and seasons_to_fetch:
+        progress_cb(total, total, seasons_to_fetch[-1])
 
     return result
 
@@ -534,11 +569,25 @@ def _duration_secs(info: dict) -> int | None:
     return None
 
 
-def scaffold(info: dict, output_root: Path) -> list[str]:
+def scaffold(
+    info: dict,
+    output_root: Path,
+    *,
+    only: tuple[int, int] | None = None,
+) -> list[str]:
     """
     Create Plex directory structure: poster, thumbnails, .info.json files.
     Returns list of plex_stem strings (relative to output_root).
     Idempotent — safe to call multiple times.
+
+    `only=(season, episode)` restricts per-episode file creation to that one
+    episode (show-level files still get created if missing). Without it the
+    function walks every episode in `info["seasons_data"]`, which is the right
+    behaviour when the caller actually scraped the whole series.
+
+    Show-level work (poster + show.info.json) is skipped when both files
+    already exist on disk — cheap short-circuit for the common case where a
+    second episode of an already-scaffolded show is being enqueued.
     """
     title     = canonical_title(info)
     year      = info.get("year")
@@ -560,6 +609,7 @@ def scaffold(info: dict, output_root: Path) -> list[str]:
             "title_orig":   info.get("title_orig"),
             "kind":         "movie",
             "release_year": int(year) if year else None,
+            "description":  info.get("description"),
             "genres":       info.get("genres", []),
             "directors":    info.get("directors", []),
             "cast":         info.get("cast", []),
@@ -577,34 +627,43 @@ def scaffold(info: dict, output_root: Path) -> list[str]:
         stems.append(f"{show_dir}/{show_dir}")
     else:
         # Series
-        poster_dest = root_dir / "poster.jpg"
-        if not poster_dest.exists():
-            _download_image(info.get("poster_url", ""), poster_dest, output_root)
-        show_meta = {
-            "id":           f"scrap-pub-{info['id']}",
-            "webpage_url":  info["url"],
-            "extractor":    "scrap-pub",
-            "title":        title,
-            "title_ru":     info.get("title_ru"),
-            "title_orig":   info.get("title_orig"),
-            "kind":         "series",
-            "release_year": int(year) if year else None,
-            "genres":       info.get("genres", []),
-            "directors":    info.get("directors", []),
-            "countries":    info.get("countries", []),
-            "rating_imdb":  info.get("rating_imdb"),
-            "imdb_id":      info.get("imdb_id"),
-            "rating_kp":    info.get("rating_kp"),
-            "kinopoisk_id": info.get("kinopoisk_id"),
-            "thumbnail":    info.get("poster_url"),
-        }
-        (root_dir / "show.info.json").write_text(
-            json.dumps(show_meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        poster_dest    = root_dir / "poster.jpg"
+        show_info_dest = root_dir / "show.info.json"
+        show_level_ready = show_info_dest.exists() and poster_dest.exists()
+        if not show_level_ready:
+            if not poster_dest.exists():
+                _download_image(info.get("poster_url", ""), poster_dest, output_root)
+            show_meta = {
+                "id":           f"scrap-pub-{info['id']}",
+                "webpage_url":  info["url"],
+                "extractor":    "scrap-pub",
+                "title":        title,
+                "title_ru":     info.get("title_ru"),
+                "title_orig":   info.get("title_orig"),
+                "kind":         "series",
+                "release_year": int(year) if year else None,
+                "description":  info.get("description"),
+                "genres":       info.get("genres", []),
+                "directors":    info.get("directors", []),
+                "countries":    info.get("countries", []),
+                "rating_imdb":  info.get("rating_imdb"),
+                "imdb_id":      info.get("imdb_id"),
+                "rating_kp":    info.get("rating_kp"),
+                "kinopoisk_id": info.get("kinopoisk_id"),
+                "thumbnail":    info.get("poster_url"),
+            }
+            show_info_dest.write_text(
+                json.dumps(show_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
         for season_num, sd in info.get("seasons_data", {}).items():
+            if only is not None and season_num != only[0]:
+                continue
             season_dir = root_dir / f"Season {season_num:02d}"
             season_dir.mkdir(exist_ok=True)
             for ep in sd["episodes"]:
+                if only is not None and ep["episode"] != only[1]:
+                    continue
                 stem_leaf = _episode_stem(show_dir, ep["season"], ep["episode"], ep.get("title"))
                 stem_rel  = f"{show_dir}/Season {season_num:02d}/{stem_leaf}"
                 stems.append(stem_rel)

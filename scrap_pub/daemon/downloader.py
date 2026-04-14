@@ -205,8 +205,21 @@ async def download_task(task: dict, state) -> None:
         f"audio={len(audios)} sub={len(subs)}")
 
     # ── 4. Scaffold Plex dirs ─────────────────────────────────────────────────
+    # For a series episode, narrow scaffold to just this episode — we don't
+    # want a re-download of one episode to (re)emit info.json + thumbnails for
+    # every other episode of the season, or to re-write show.info.json when
+    # it already exists on disk.
+    import functools as _ft
+    scaffold_only: tuple[int, int] | None = None
+    if task["kind"] == "episode":
+        scaffold_only = (int(task["season"]), int(task["episode"]))
     try:
-        await net_run(state, scaffold, item_from_meta(item), output_root)
+        await net_run(
+            state,
+            _ft.partial(
+                scaffold, item_from_meta(item), output_root, only=scaffold_only,
+            ),
+        )
     except Exception as e:
         log("WARN", f"Scaffold error (non-fatal): {e}")
 

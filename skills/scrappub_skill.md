@@ -137,9 +137,16 @@ scrap-pub resume
 
 `--since`, `--until`, and `--completed-since` accept human-friendly specs:
 `today`, `yesterday`, `week`, `month`, `7d`, `24h`, `30m`, or an ISO
-timestamp. Pending/active/failed tasks are always included in the web UI view
-regardless of window (`include_unfinished=true`), so you never lose sight of
-in-flight work.
+timestamp. `today` and `yesterday` resolve to the **user's local calendar
+day** (midnight local, converted to UTC for the SQLite comparison), not UTC
+midnight. `week` / `month` / `Nd` / `Nh` / `Nm` are rolling offsets from
+the current instant.
+
+The same parser runs both client-side (`scrap-pub list --since ...`) and
+server-side (the web UI's Today / Week / Month chips), so both surfaces
+agree on what "today" means. Pending/active/failed tasks are always
+included in the web UI view regardless of window (`include_unfinished=true`),
+so you never lose sight of in-flight work.
 
 ### Task detail — `scrap-pub show`
 
@@ -194,6 +201,24 @@ episodes, but a bare `/item/view/ITEM_ID` could be either — and a URL that
 **Always run `scrap-pub lookup URL` first** (next section) before choosing
 a Plex library path.
 
+### Per-episode vs whole-series scope
+
+When you enqueue `/item/view/ITEM_ID/s3e5`, scrap-pub narrows *everything*
+to that one episode:
+
+- `scrape()` only fetches season 3's page — no rate-limited walk across
+  every other season of a 13-season show.
+- `scaffold()` only creates `s03e05.info.json` + `s03e05-thumb.jpg` — not
+  metadata for every episode of every season.
+- The show-level `show.info.json` + `poster.jpg` are written **only if
+  they don't already exist** on disk. Enqueuing a second episode of the
+  same show skips show-level work entirely.
+
+When you enqueue `/item/view/ITEM_ID` (no season suffix), the full walk
+happens and every episode of every season gets a task row + metadata file.
+Prefer episode URLs when you only want one episode — the difference is
+large on long-running shows.
+
 ---
 
 ## Lookup (pre-enqueue reconnaissance)
@@ -228,7 +253,13 @@ scrap-pub lookup "https://example.com/item/view/30658/s10e4"
 # per-episode URLs (e.g. to enqueue a single specific episode).
 scrap-pub lookup "https://example.com/item/view/30658/s10e4" --episodes
 
-# Machine-readable output — suitable for piping into jq or another agent
+# Also print the synopsis/plot text scraped from the item page, wrapped
+# to the terminal. Useful when deciding what to download or for a human-
+# readable blurb alongside title/year/kind.
+scrap-pub lookup "https://example.com/item/view/121936/s0e1" --description
+
+# Machine-readable output — suitable for piping into jq or another agent.
+# The `description` field is always present in --json regardless of -d.
 scrap-pub lookup "https://example.com/item/view/121936/s0e1" --json
 ```
 
@@ -326,22 +357,31 @@ was passed at enqueue (see [Downloading into a Plex library](#downloading-into-a
     Hoppers(2026).mkv                    ← movie, h264 video + RUS/ENG audio tracks
     Hoppers(2026).rus.srt                ← subtitle sidecar (if available)
     Hoppers(2026).jpg                    ← poster
-    Hoppers(2026).info.json              ← metadata
+    Hoppers(2026).info.json              ← metadata (includes `description`)
 
   Big Mistakes(2026)/
     Season 01/
       Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.mkv
       Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.rus.srt
       Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.eng.srt
+      Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.info.json
+      Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace-thumb.jpg
       ...
     poster.jpg
-    show.info.json
-    thumbnails/
-      s01e01.jpg
-      ...
+    show.info.json                       ← show-level metadata (includes `description`)
 ```
 
 Naming follows Plex media naming conventions (see `docs/spec.md → Output structure`).
+
+**Metadata notes:**
+- Both `show.info.json` (series) and `{Title}.info.json` (movie) carry a
+  `description` field holding the synopsis/plot text scraped from the item
+  page. For series this is the same text shown on any individual episode
+  page — the site doesn't expose a distinct "show overview" blurb.
+- `show.info.json` + `poster.jpg` are written once. When a second episode
+  of an already-scaffolded series is enqueued, `scaffold()` short-circuits
+  the show-level work instead of re-downloading the poster or overwriting
+  `show.info.json`.
 
 ---
 

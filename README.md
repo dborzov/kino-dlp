@@ -140,7 +140,8 @@ scrap-pub status
 # Inspect a URL BEFORE enqueueing — title, year, movie-vs-TV-show.
 # Runs locally (no daemon); reads cookies from ~/.config/scrap-pub/cookies.txt.
 scrap-pub lookup "https://example.com/item/view/121639/s0e1"
-scrap-pub lookup "https://example.com/item/view/122266/s1e1" --episodes  # full breakdown
+scrap-pub lookup "https://example.com/item/view/122266/s1e1" --episodes     # full episode breakdown
+scrap-pub lookup "https://example.com/item/view/122266/s1e1" --description  # + synopsis/plot text
 
 # Enqueue downloads (URLs on the target site you configured via `website`)
 scrap-pub enqueue "https://example.com/item/view/121639/s0e1"   # movie
@@ -185,9 +186,11 @@ ls  "$(scrap-pub paths tmp)"     # peek at ffmpeg's working files
 `scrap-pub list` accepts `--status`, `--kind`, `--since`, `--until`,
 `--completed-since`, `--limit`, `--offset`, `-v/--verbose`, and `--json`. Time
 SPECs are human-friendly: `today`, `yesterday`, `week`, `month`, `7d`, `24h`,
-`30m`, or an ISO timestamp. `scrap-pub show` takes a positional task id and
-prints timestamps, attempts, output size, and (for active tasks) live
-per-stream progress with ETA.
+`30m`, or an ISO timestamp. `today` and `yesterday` are resolved against the
+user's **local** calendar day, not UTC — so the web UI's Today/Week/Month chips
+and the CLI `--since` flag agree with whatever "today" means wherever the user
+is sitting. `scrap-pub show` takes a positional task id and prints timestamps,
+attempts, output size, and (for active tasks) live per-stream progress with ETA.
 
 `scrap-pub sql` rejects anything that isn't `SELECT` / `WITH` / `PRAGMA` /
 `EXPLAIN` unless `--write` is passed, and caps results at `--limit` rows

@@ -82,6 +82,7 @@ scrap_pub/
     ws_server.py             serve_ws() · ws_handler() · broadcast() · command dispatch
     server_http.py           stdlib HTTPServer: GET / → web UI, GET /health
     ui.py                    HTML_UI: single-file web UI (5 tabs, per-stream progress bars)
+    timespec.py              parse_since(): shared human-friendly time-window parser (CLI + daemon)
     server_main.py           scrap-pub-server entry point
     cli_main.py              scrap-pub CLI: all subcommands via WebSocket
 ```
