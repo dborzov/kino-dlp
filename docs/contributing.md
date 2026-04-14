@@ -113,6 +113,75 @@ ls ~/output/
 
 For UI work: open `http://localhost:8765` and exercise each tab while a task runs — progress bars, ETA, and per-task output size should update live via WebSocket. Enqueue an obviously-bad URL to verify the error toast appears (silent failure bug fix).
 
+### Per-task `--output-dir` smoke test
+
+Covers the filesystem validation surface added for the "drop into a Plex
+library directly" feature. Meant to fail loudly, not silently.
+
+```bash
+# 0. start the daemon as above
+
+# 1. happy path: custom output directory honored end-to-end
+mkdir -p /tmp/fake-plex/TV\ Shows
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir "/tmp/fake-plex/TV Shows"
+# Wait for the task to finish, then confirm the Plex-ready tree was built
+# under the custom path — NOT under ~/output.
+tree /tmp/fake-plex/TV\ Shows
+scrap-pub show <ID>           # 'output_dir' line should show the custom path
+
+# 2. typo: parent missing → immediate error, no task row
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir "/mtn/plex/nope"
+# expect: "Error: ... output directory parent does not exist: /mtn (typo?)"
+scrap-pub list --since today | grep -c "/mtn"    # should be 0
+
+# 3. unwritable: chmod 500, then enqueue into it
+mkdir /tmp/locked-out
+chmod 500 /tmp/locked-out
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir "/tmp/locked-out"
+# expect: "Error: ... not writable: /tmp/locked-out"
+chmod 700 /tmp/locked-out
+rmdir /tmp/locked-out
+
+# 4. low free space: temporarily crank min_free_space_gb very high
+scrap-pub config --set min_free_space_gb=9999
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir /tmp/fake-plex
+# expect: "Error: ... insufficient free space at /tmp/fake-plex: X.X GB free,
+#          need 9999 GB"
+scrap-pub config --set min_free_space_gb=10    # restore
+
+# 5. re-enqueue conflict: same item, different --output-dir → loud failure
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir "/tmp/fake-plex/TV Shows"
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir "/tmp/fake-plex/Movies"
+# expect: "Error: ... task N already exists with a different output_dir ...
+#          Delete it first"
+
+# 6. disappearing directory between enqueue and worker claim
+scrap-pub pause
+scrap-pub enqueue "https://example.com/item/view/121639/s1e1" \
+  --output-dir /tmp/fake-plex/vanish
+rm -rf /tmp/fake-plex/vanish/..   # remove the parent so the dir is gone
+scrap-pub resume
+# expect: task transitions to failed with a readable last_error;
+#         `scrap-pub show <ID>` + web UI both display it.
+
+# 7. add-sub on a custom-dir task drops the sidecar in the custom dir
+scrap-pub add-sub <custom_dir_task_id> "https://example.com/path/to/sub.vtt" \
+  --lang eng
+find /tmp/fake-plex -name "*.eng.srt"   # should appear under the custom root
+```
+
+Web UI check: the enqueue form on the **Queue** tab has a second text field
+for the optional output directory. Each task card should display a
+`→ /path` tag under the title when the task was enqueued with one. Trigger
+each of the errors above from the form to verify the toast surfaces the
+daemon's error message verbatim.
+
 ---
 
 ## Project layout

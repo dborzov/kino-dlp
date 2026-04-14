@@ -115,7 +115,7 @@ CREATE TABLE tasks (
     episode       INTEGER NOT NULL,   -- movies use sentinel 1
     episode_title TEXT,
     media_id      TEXT,
-    plex_stem     TEXT,               -- relative path stem under output_dir
+    plex_stem     TEXT,               -- relative path stem under the effective output root
     status        TEXT NOT NULL DEFAULT 'pending',
                                       -- pending | active | done | failed | skipped
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -124,6 +124,7 @@ CREATE TABLE tasks (
     started_at    TEXT,
     completed_at  TEXT,
     mkv_path      TEXT,
+    output_dir    TEXT,               -- per-task override; NULL = use config.output_dir
     UNIQUE(item_id, season, episode)
 );
 CREATE INDEX idx_tasks_status       ON tasks(status);
@@ -181,6 +182,15 @@ cookies](spec.md#session-cookies)). The daemon reads the file at startup and
 rewrites it when the user uploads fresh cookies via `scrap-pub cookies FILE` or
 the Web UI.
 
+### Schema migrations
+
+`db.open_db()` runs `SCHEMA` (the `CREATE TABLE IF NOT EXISTS` block) plus a
+tiny `_migrate()` step that inspects `PRAGMA table_info(tasks)` and runs any
+missing `ALTER TABLE tasks ADD COLUMN …` statements. Today that's just
+`output_dir TEXT`, added for per-task output overrides; the migration is
+idempotent and safe under WAL. There is no migrations table and no
+versioning — new columns are always nullable and always added here.
+
 ### Why stream-level tracking
 
 One `streams` row per track (video, each audio, each subtitle) unlocks:
@@ -223,10 +233,15 @@ CLI/UI ─WS "enqueue"─▶ ws_server.dispatch ─▶ scraper.scrape(url)
                                 ▼
                    ffmpeg merge (stream-copy, no re-encode)
                                 ▼
-                      output/{plex_stem}.mkv
+                 {output_root}/{plex_stem}.mkv
                                 ▼
                     task.status = done, cleanup tmp
 ```
+
+`{output_root}` is `task.output_dir` when the task was enqueued with
+`--output-dir`, otherwise `config.output_dir`. The `{tmp_dir}/…` working
+paths are unaffected by per-task overrides — scratch files always live
+under `config.tmp_dir`.
 
 Every database write emits a `progress_queue` event → `broadcaster` → WebSocket clients.
 
@@ -244,7 +259,8 @@ See [spec.md § WebSocket protocol](spec.md#websocket-protocol) for the full com
 ## Filesystem layout at runtime
 
 ```
-{output_dir}/                       final MKVs + sidecars (see spec.md)
+{output_dir}/                       default final-MKV + sidecar root (see spec.md)
+{task.output_dir}/                  alternate root when a task was enqueued with --output-dir
 {tmp_dir}/                          ffmpeg working files, cleaned on task done
 ~/.config/scrap-pub/config.json     daemon config (overridable with --config)
 ~/.config/scrap-pub/cookies.txt     Netscape cookies.txt (overridable via cookies_path)

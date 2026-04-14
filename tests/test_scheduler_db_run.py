@@ -11,6 +11,7 @@ import pytest
 
 from scrap_pub.daemon.config import Config
 from scrap_pub.daemon.db import (
+    db_claim_next_task,
     db_insert_task,
     db_set_task_status,
     db_update_stream,
@@ -193,3 +194,42 @@ async def test_db_run_mixed_positional_and_kwargs(state):
     ).fetchone()
     assert row["status"] == "done"
     assert row["mkv_path"] == "/path/to/output.mkv"
+
+
+# ── output_dir persistence ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_output_dir_survives_reclaim(state, tmp_path):
+    """A task enqueued with a custom output_dir keeps it across a daemon restart.
+
+    Simulates the daemon-restart path: insert with output_dir, close conn,
+    re-open the same DB file (as open_db would on boot), then db_claim_next_task
+    and assert output_dir is still attached to the row. This is what the
+    worker sees when it picks up a task that was queued before the daemon
+    was restarted.
+    """
+    custom = str(tmp_path / "plex" / "TV Shows")
+    db_upsert_item(state.conn, {
+        "id": "restart-1", "kind": "movie",
+        "title_orig": "Test", "title_ru": None, "year": 2026,
+        "url": "https://example.com/item/view/restart-1",
+        "poster_url": None, "meta_json": "{}",
+    })
+    tid = db_insert_task(state.conn,
+        item_id="restart-1", kind="movie", season=0, episode=1,
+        episode_title=None, media_id="m1",
+        plex_stem="Test(2026)/Test(2026)",
+        output_dir=custom,
+    )
+    assert tid is not None
+
+    # Simulate daemon restart: close + reopen on the same DB file.
+    db_path = Path(state.config.db_path)
+    state.conn.close()
+    state.conn = open_db(db_path)
+
+    claimed = db_claim_next_task(state.conn)
+    assert claimed is not None
+    assert claimed["id"] == tid
+    assert claimed["output_dir"] == custom

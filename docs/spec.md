@@ -2,7 +2,7 @@
 
 > One-line summary: user-facing behavior — config, CLI, WebSocket protocol, download flow, error handling, output layout.
 >
-> Last updated: 2026-04-13
+> Last updated: 2026-04-14
 
 For the system map and SQLite schema see [architecture.md](architecture.md). For why these
 choices were made see [internals.md](internals.md).
@@ -16,25 +16,26 @@ Override with `scrap-pub-server --config /path/to/config.json`.
 
 ```json
 {
-  "website":           "",
-  "output_dir":        "~/output",
-  "tmp_dir":           "~/tmp",
-  "db_path":           "~/.local/share/scrap-pub/queue.db",
-  "cookies_path":      "~/.config/scrap-pub/cookies.txt",
-  "concurrency":       2,
-  "stall_timeout_sec": 300,
-  "http_port":         8765,
-  "ws_port":           8766,
-  "video_quality":     "lowest",
-  "audio_langs":       ["RUS", "ENG", "FRE"],
-  "sub_langs":         ["rus", "eng", "fra"]
+  "website":            "",
+  "output_dir":         "~/output",
+  "tmp_dir":            "~/tmp",
+  "db_path":            "~/.local/share/scrap-pub/queue.db",
+  "cookies_path":       "~/.config/scrap-pub/cookies.txt",
+  "concurrency":        2,
+  "stall_timeout_sec":  300,
+  "http_port":          8765,
+  "ws_port":            8766,
+  "video_quality":      "lowest",
+  "audio_langs":        ["RUS", "ENG", "FRE"],
+  "sub_langs":          ["rus", "eng", "fra"],
+  "min_free_space_gb":  10
 }
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `website` | `""` (unset) | Base URL of the target site (e.g. `https://example.com`). You must set this — the repo ships with no default target; scraping fails until it's configured. |
-| `output_dir` | `~/output` | Final MKVs + sidecars + posters |
+| `output_dir` | `~/output` | **Default** final-output root. A task enqueued without `--output-dir` lands here. Per-task overrides take precedence and do not retroactively move tasks that are already queued or done. |
 | `tmp_dir` | `~/tmp` | ffmpeg working dir; auto-cleaned on task done |
 | `db_path` | `~/.local/share/scrap-pub/queue.db` | SQLite queue |
 | `cookies_path` | `~/.config/scrap-pub/cookies.txt` | Netscape cookies.txt with target-site session cookies |
@@ -45,6 +46,7 @@ Override with `scrap-pub-server --config /path/to/config.json`.
 | `video_quality` | `lowest` | `lowest` \| `highest` \| `720p` \| `1080p` |
 | `audio_langs` | `["RUS","ENG","FRE"]` | Audio tracks to embed (ISO-639-2 uppercase) |
 | `sub_langs` | `["rus","eng","fra"]` | Subtitle sidecar languages (ISO-639-2 lowercase) |
+| `min_free_space_gb` | `10` | Advisory free-space floor for enqueue and task-start checks. Applies to both the default `output_dir` and any per-task `--output-dir`. A season of 1080p content can easily exceed 40 GB, so this is a "don't even try when the disk is nearly full" guard, *not* a per-task estimate. The check is **not** atomic across concurrent workers — treat it as advisory. Set to `0` to disable entirely. |
 
 All `~` paths expand at load time. Update at runtime:
 
@@ -145,12 +147,27 @@ error: cannot connect to ws://localhost:8766 — is scrap-pub-server running?
 scrap-pub status
     Show daemon status: paused, active workers, queue counts, cookie_ok.
 
-scrap-pub enqueue URL [URL ...]
+scrap-pub enqueue URL [URL ...] [-o PATH | --output-dir PATH]
     Scrape URL(s) on the configured target site and enqueue all episodes/movies found.
     URL forms (assuming `website` is set to e.g. https://example.com):
       https://example.com/item/view/12345          → all episodes of a series
       https://example.com/item/view/12345/s1e3     → specific episode
       https://example.com/item/view/12345/s0e1     → movie (season=0, episode=1)
+
+    --output-dir PATH
+        Write this task's output (MKV, metadata, poster/thumbnails, subtitle
+        sidecars) under PATH instead of the daemon-wide `output_dir` config.
+        Intended for dropping content directly into a media-server library:
+            scrap-pub enqueue URL --output-dir "/mnt/plex/TV Shows"
+        The inside-the-root layout (ShowName(Year)/Season XX/…) does not
+        change. The flag applies to every URL in this invocation.
+        PATH is resolved client-side (absolute, `~` expanded), then the
+        daemon re-validates parent/permissions/free-space on its own
+        filesystem before any task row or scaffold file is written. If the
+        same item has already been enqueued under a different `--output-dir`,
+        the command fails with a "delete existing task first" error — it
+        does **not** silently ignore the flag. Missing directories are
+        auto-created *only* when the parent exists and is writable.
 
 scrap-pub list [--status STATUS] [--kind K] [--since SPEC] [--until SPEC]
               [--completed-since SPEC] [--limit N] [--offset N] [-v] [--json]
@@ -233,7 +250,7 @@ Single port (default `8766`). All messages are JSON.
 | `get` | `task_id` | Single task with `streams`, live progress overlay, and `output_size_bytes`. Replies `ok: false` if not found. |
 | `sql` | `query`, `params?`, `write?`, `max_rows?` | Run a SQL query. Read-only by default (first-token gate: `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`); set `write: true` to allow DML/DDL. Reply includes `columns`, `rows`, `rowcount`, `truncated`. Row cap defaults to 1000. |
 | `logs` | `task_id?`, `limit?` | Log entries |
-| `enqueue` | `url` | Scrape + create tasks |
+| `enqueue` | `url`, `output_dir?` | Scrape + create tasks. Optional `output_dir` overrides the default `output_dir` config for every task created by this call. The server validates it (parent exists, writable, free space ≥ `min_free_space_gb`) before any scraping happens; on failure the reply is `{ok: false, error: "..."}` and no task rows or scaffold files are written. A re-enqueue of an already-queued item with a different `output_dir` also fails with a clear error. |
 | `retry` | `task_id` | Reset task to pending (clears `completed_at`) |
 | `skip` | `task_id` | Mark task skipped |
 | `pause` | — | Pause workers |
@@ -272,18 +289,21 @@ On connect the server immediately sends `daemon_status` + the last 50 global log
 
 For each claimed task the worker does:
 
-1. **Idempotency check** — if `{output_dir}/{plex_stem}.mkv` already exists and is non-empty, mark task `done` and skip.
+0. **Resolve output root** — `task.output_dir` (per-task override) if set, else `config.output_dir`. Re-validates existence, writability, and free space. If the directory vanished between enqueue and claim (unmount, rename, permissions change) the task is marked `failed` with a readable `last_error` like `"output directory not writable: /mnt/plex"` and the worker moves on. References below to `{output_root}` mean this resolved path.
+1. **Idempotency check** — if `{output_root}/{plex_stem}.mkv` already exists and is non-empty, mark task `done` and skip.
 2. **Ensure metadata** — if `items.meta_json` is missing, call `scraper.scrape(url)` and upsert the row.
 3. **Resolve manifest** — fetch a fresh signed HLS master `.m3u8`. URLs have a ~24h TTL, so this always happens on resume.
-4. **Parse manifest** — extract video quality tiers, audio tracks, subtitle tracks.
+4. **Parse manifest** — extract video quality tiers, audio tracks, subtitle tracks. After `duration_sec` is known, a rough disk-space re-check fires using `max(min_free_space_gb, duration_sec/3600 * 3 + 2)` GB; failure marks the task failed with a clear message.
 5. **Select streams** — per `video_quality`, `audio_langs`, `sub_langs`.
 6. **Upsert stream rows** — already-`done` rows are skipped (this is the resume mechanism).
-7. **Scaffold Plex dirs** — create dirs, download poster + thumbnails, write `.info.json` (idempotent).
-8. **Subtitles first** — small, fast, cheap. Sidecar `.srt` written next to the MKV location.
+7. **Scaffold Plex dirs** — create dirs under `{output_root}`, download poster + thumbnails, write `.info.json` (idempotent).
+8. **Subtitles first** — small, fast, cheap. Sidecar `.srt` written next to the MKV location in `{output_root}`.
 9. **Video stream** — `{tmp_dir}/{plex_stem}_video.mp4`.
 10. **Audio streams** — `{tmp_dir}/{plex_stem}_audio_{lang}.m4a`, one per selected language.
-11. **Merge** — single ffmpeg stream-copy invocation produces `{output_dir}/{plex_stem}.mkv`. No re-encode.
+11. **Merge** — single ffmpeg stream-copy invocation produces `{output_root}/{plex_stem}.mkv`. No re-encode.
 12. **Cleanup** — remove `{tmp_dir}/*` for this task; task `status=done`; emit `task_update`.
+
+Note that `{tmp_dir}` always comes from `config.tmp_dir` — per-task overrides only affect the final-output root, not the scratch directory.
 
 ---
 
@@ -314,6 +334,40 @@ Scraper detects 403 or login redirect → raises `CookieExpiredError`.
 
 See [§ Session cookies](#session-cookies) for the full cookie list and export steps.
 
+### Filesystem errors
+
+Filesystem problems are caught at three checkpoints and surface as concise,
+actionable error messages:
+
+1. **Enqueue time** (`scrap-pub enqueue --output-dir`, WS `enqueue` payload):
+   `validate_task_output_dir` runs before any scraping or DB write. It expands
+   `~`, resolves to absolute, auto-creates missing directories when the
+   *parent* exists and is writable (so typos like `/mtn/plex` fail rather than
+   materialising a stray tree), and runs a write-probe. Failure → CLI/WS
+   error, no task row, no poster, no metadata JSON. Error messages include
+   the offending path and the reason, e.g.:
+   - `"output directory parent does not exist: /mtn/plex/TV Shows — did you mean /mnt/plex/TV Shows?"`
+   - `"not a directory: /home/user/plex-not-a-dir"`
+   - `"not writable: /mnt/plex/locked (permission denied)"`
+   - `"insufficient free space at /mnt/plex: 2.1 GB free, need 10 GB"`
+2. **Task start** (top of `download_task`): the effective output root is
+   re-resolved and re-validated. A disk can be unmounted or a directory
+   renamed between enqueue and worker claim, and this catches it instead of
+   crashing mid-download. The task transitions to `failed` with the
+   validation message in `last_error`.
+3. **Mid-download**: `OSError`s from `mkdir`, writing the merged MKV, or
+   writing subtitle sidecars are wrapped in `TaskFSError`, which carries
+   the operation *and* the path. `last_error` reads like
+   `"writing merged MKV to /mnt/plex/foo.mkv: No space left on device"`
+   instead of the raw `[Errno 28]`.
+
+The disk-free check is **advisory**: it is not atomic across concurrent
+workers, and it uses a conservative `~3 GB/hour` floor added on top of
+`min_free_space_gb`, which is right for 1080p content most of the time but
+not a precise reservation. Two workers can both pass the check and then run
+out of space during the merge — they fall through to the `TaskFSError`
+handler above.
+
 ### Task failed
 
 `scrap-pub list --status failed` shows failed tasks. `scrap-pub retry ID` resets a task to `pending` (streams that are still `done` are reused — not re-downloaded).
@@ -324,8 +378,13 @@ See [§ Session cookies](#session-cookies) for the full cookie list and export s
 
 Mirrors Plex media naming conventions. Titles come from the target site's `og:title` in the **original language** of the content: English title for English shows, French for French films, Russian for Russian shows.
 
+The output **root** is either `config.output_dir` (default) or the per-task
+`--output-dir` passed at enqueue. The inside-the-root layout is identical
+either way, so pointing a task directly at a Plex library drops a scanner-
+ready tree in place:
+
 ```
-{output_dir}/
+{output_root}/
   Hoppers(2026)/
     Hoppers(2026).mkv          ← video + embedded RUS/ENG/FRE audio
     Hoppers(2026).rus.srt      ← sidecar subtitle (if available)
@@ -352,4 +411,4 @@ Full Plex naming reference: [plex_naming.md](plex_naming.md).
 - **Task-level** — existing non-empty `mkv_path` short-circuits the worker
 - **Stream-level** — only `pending` streams are re-downloaded; `done` streams are reused
 - **Scaffold** — `scaffold()` skips already-downloaded posters/thumbnails; always re-writes `.info.json`
-- **Enqueue** — the `UNIQUE(item_id, season, episode)` index dedupes; re-enqueuing is a no-op
+- **Enqueue** — the `UNIQUE(item_id, season, episode)` index dedupes; re-enqueuing an item with the *same* (or no) `--output-dir` is a no-op. Re-enqueuing with a *different* `--output-dir` fails loudly instead of silently ignoring the new path — delete the existing task first.

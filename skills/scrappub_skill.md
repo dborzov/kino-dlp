@@ -98,6 +98,11 @@ scrap-pub enqueue "https://example.com/item/view/122266/s1e1"
 # Enqueue all episodes in a series
 scrap-pub enqueue "https://example.com/item/view/122266"
 
+# Enqueue directly into a Plex library directory (see "Downloading into a
+# Plex library" below for the full recipe and error modes)
+scrap-pub enqueue "https://example.com/item/view/122266" \
+  --output-dir "/mnt/plex/TV Shows"
+
 # Inspect the queue
 scrap-pub list                                    # most recent 50
 scrap-pub list --status pending
@@ -224,22 +229,25 @@ scrap-pub config --set website="https://example.com"
 | Key | Default | Description |
 |-----|---------|-------------|
 | `website` | `""` | Base URL of the target site. **Required** — daemon refuses to start without it. |
-| `output_dir` | `<project>/output` | Where Plex-ready MKVs are written |
+| `output_dir` | `<project>/output` | **Default** Plex-ready MKV root. Each task can override it with `--output-dir` — do *not* `config --set output_dir=...` as a per-task workaround. |
 | `tmp_dir` | `<project>/tmp` | Working directory for ffmpeg (cleaned on task done) |
-| `concurrency` | `2` | Parallel download workers |
+| `concurrency` | `2` | Parallel download workers. **Keep this at 2** — higher values are not faster (bandwidth-bound) and make the traffic pattern look non-human to Cloudflare, triggering challenges. |
 | `video_quality` | `lowest` | `lowest` \| `highest` \| `720p` \| `1080p` |
 | `audio_langs` | `["RUS","ENG","FRE"]` | Which audio tracks to include in MKV |
 | `sub_langs` | `["rus","eng","fra"]` | Which subtitle languages to download as sidecars |
 | `stall_timeout_sec` | `300` | Seconds without ffmpeg progress before killing download |
+| `min_free_space_gb` | `10` | Advisory free-space floor for both the default `output_dir` and any per-task `--output-dir`. The enqueue-time and task-start checks refuse to proceed when the target filesystem has less than this much free (plus a duration-aware adjustment, ~3 GB per hour of runtime). Set to `0` to disable entirely — not recommended, the daemon will still crash mid-download on ENOSPC, it just won't give you the early warning. |
 
 ---
 
 ## Output Structure
 
-Downloads land at `{output_dir}` with Plex-ready names:
+Downloads land at `{output_root}` with Plex-ready names. `{output_root}` is
+`config.output_dir` by default, or the per-task `--output-dir` path if one
+was passed at enqueue (see [Downloading into a Plex library](#downloading-into-a-plex-library) below).
 
 ```
-{output_dir}/
+{output_root}/
   Hoppers(2026)/
     Hoppers(2026).mkv                    ← movie, h264 video + RUS/ENG audio tracks
     Hoppers(2026).rus.srt                ← subtitle sidecar (if available)
@@ -260,6 +268,98 @@ Downloads land at `{output_dir}` with Plex-ready names:
 ```
 
 Naming follows Plex media naming conventions (see `docs/spec.md → Output structure`).
+
+---
+
+## Downloading into a Plex library
+
+The default `config.output_dir` is a single directory shared by every task.
+When you want one specific download to land under a Plex (or Jellyfin /
+Emby / Kodi) library path — so the media server picks it up without any
+move/symlink step — pass `--output-dir PATH` at enqueue time:
+
+```bash
+# TV show → "TV Shows" library
+scrap-pub enqueue "https://example.com/item/view/122266" \
+  --output-dir "/mnt/plex/TV Shows"
+
+# Movie → "Movies" library
+scrap-pub enqueue "https://example.com/item/view/121639/s0e1" \
+  --output-dir "/mnt/plex/Movies"
+
+# Multiple URLs in one invocation — the flag applies to all of them
+scrap-pub enqueue URL1 URL2 URL3 --output-dir "/mnt/plex/TV Shows"
+```
+
+The inside-the-root layout is identical to the default (same Plex-ready
+`ShowName(Year)/Season XX/episode.mkv` structure), so a Plex scanner
+watching `/mnt/plex/TV Shows` will see a clean tree with poster, thumbnails,
+`.info.json`, and subtitle sidecars in the right places.
+
+### Rules and guarantees
+
+- `PATH` is **resolved client-side** before the WebSocket call — `~`
+  expands and relative paths become absolute. The daemon re-validates on
+  its own filesystem (which may differ from the CLI host when using a
+  remote daemon).
+- If the directory doesn't exist but its *parent* does and is writable,
+  the daemon creates it. If the parent is missing too, the enqueue fails
+  immediately — this catches typos like `/mtn/plex` → no stray trees.
+- Every task's `output_dir` is stored on the row and persists across
+  daemon restarts. Use `scrap-pub show TASK_ID` to verify — the
+  `output_dir  : /mnt/plex/TV Shows  (custom)` line shows up when the
+  override is active.
+- **Re-enqueueing a URL with a different `--output-dir` fails loudly**
+  with a "task N already exists with a different output_dir; delete it
+  first" error. `INSERT OR IGNORE` would have silently kept the original
+  path, and you would never know your override was ignored — so the code
+  checks explicitly. Delete the old task first if you really want to
+  change the destination.
+- **Never** use `scrap-pub config --set output_dir=...` as a per-task
+  workaround. That changes the default for every *other* queued task
+  too. `--output-dir` is the only correct mechanism.
+- The `tmp_dir` is not overridable — scratch files always live under
+  `config.tmp_dir`, no matter where the final output goes.
+
+### Free-space check (advisory)
+
+Before enqueue succeeds, the daemon checks:
+
+```
+free_space(PATH) >= min_free_space_gb * 1 GB
+```
+
+After the manifest is parsed (and duration is known) a second, more
+refined check fires using `max(min_free_space_gb, duration_sec/3600 * 3 +
+2)` GB. For a 10-hour season that's 32 GB, roughly what a 1080p rip
+takes. Both checks are **advisory**, not atomic: two workers can both pass
+the check and then race for the last few GB — in that case the merge fails
+with a `TaskFSError` that surfaces as a readable `last_error`.
+
+Set `min_free_space_gb=0` in config to disable the check entirely. Not
+recommended — the daemon will still crash on ENOSPC mid-download, you just
+won't get the early warning.
+
+---
+
+## Filesystem errors (troubleshooting)
+
+Every filesystem failure — whether it hits at enqueue, at task start, or
+mid-download — surfaces as a concise, path-tagged string. Read the message
+literally; the daemon does not truncate it.
+
+| Error | Meaning | Fix |
+|-------|---------|-----|
+| `output directory parent does not exist: /mtn/plex (typo?)` | You passed `--output-dir /mtn/plex/...` but `/mtn` doesn't exist. Almost always a typo (`/mtn` → `/mnt`). | Re-run with the correct path. The daemon never creates parent directories — it wants you to notice typos. |
+| `not a directory: /home/user/plex` | A *file* already exists at that path. | Remove/rename it, or point `--output-dir` at an actual directory. |
+| `not writable: /mnt/plex (permission denied)` | The directory exists but the daemon can't write to it. Common when the library is owned by the `plex` user and scrap-pub runs as your user. | Fix the permissions (e.g. `sudo chown -R $USER:$USER /mnt/plex` in a dev setup, or add your user to the `plex` group, or set `g+w` on the library). |
+| `insufficient free space at /mnt/plex: 2.1 GB free, need 10 GB` | Less than `min_free_space_gb` of room on the target filesystem. | Free up space, lower `min_free_space_gb`, or point `--output-dir` at a different volume. |
+| `task 42 already exists for this item with a different output_dir (/mnt/plex/Movies). Delete it first, then re-enqueue.` | Re-enqueue conflict. The item was previously enqueued with a different destination. | `scrap-pub skip 42` (or delete the row directly) and re-enqueue. |
+| `writing merged MKV to /mnt/plex/foo.mkv: No space left on device` | Disk filled up during the final merge, *after* both free-space checks passed. The checks are advisory — this happens when two workers race, or when a parallel unrelated process wrote a large file at the wrong moment. | Free space and `scrap-pub retry <ID>`. |
+| `output directory disappeared: /mnt/plex` (in `last_error`) | The mount vanished or the directory was renamed between enqueue and task start. | Re-mount / re-create the directory and `scrap-pub retry <ID>`. |
+
+`scrap-pub show TASK_ID` and the web UI both display `last_error`
+verbatim — there's no hidden stack trace to dig up.
 
 ---
 
@@ -304,6 +404,14 @@ async def cmd(payload):
 # Examples
 asyncio.run(cmd({"cmd": "status"}))
 asyncio.run(cmd({"cmd": "enqueue", "url": "https://example.com/item/view/121639/s0e1"}))
+
+# Per-task output directory — optional; omit for the default output_dir
+asyncio.run(cmd({
+    "cmd": "enqueue",
+    "url": "https://example.com/item/view/122266",
+    "output_dir": "/mnt/plex/TV Shows",
+}))
+
 asyncio.run(cmd({"cmd": "list", "status": "pending", "limit": 20}))
 asyncio.run(cmd({"cmd": "list", "verbose": True, "since": "2026-04-01T00:00:00+00:00"}))
 asyncio.run(cmd({"cmd": "get",  "task_id": 42}))

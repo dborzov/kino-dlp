@@ -98,6 +98,11 @@ nav button:hover { color: var(--text); }
 .badge.failed     { background: #3a1a1a; color: var(--red); }
 .badge.skipped    { background: #2d2a1a; color: var(--yellow); }
 .task-actions { display: flex; gap: 5px; }
+.task-output-dir {
+  margin-top: 4px; font-size: .72rem; color: var(--muted);
+  font-family: ui-monospace, monospace; overflow: hidden;
+  white-space: nowrap; text-overflow: ellipsis;
+}
 
 /* ── Streams ── */
 .streams { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
@@ -238,6 +243,7 @@ progress.done::-webkit-progress-value { background: var(--green); }
 <div id="tab-queue" class="tab-content active">
   <div class="enqueue-form">
     <input id="enqueue-url" type="text" placeholder="https://your-site.example/item/view/..." />
+    <input id="enqueue-output-dir" type="text" placeholder="/mnt/plex/TV Shows (optional — leave empty for default)" />
     <button class="btn-primary" onclick="doEnqueue()">+ Add</button>
   </div>
   <div class="section-title" id="pending-title">Pending (0)</div>
@@ -588,6 +594,12 @@ function metaHTML(t) {
   `;
 }
 
+function outputDirHTML(t) {
+  if (!t.output_dir) return '';
+  const path = escHtml(t.output_dir);
+  return `<div class="task-output-dir" title="Custom output directory">→ ${path}</div>`;
+}
+
 function renderPendingList() {
   const pending = Object.values(state.tasks).filter(t => t.status === 'pending');
   id('pending-title').textContent = `Pending (${pending.length})`;
@@ -603,6 +615,7 @@ function renderPendingList() {
             <button class="btn-ghost btn-sm" onclick="skipTask(${t.id})">Skip</button>
           </div>
         </div>
+        ${outputDirHTML(t)}
       </div>
     `).join('');
 }
@@ -637,6 +650,7 @@ function renderDoneList() {
           ${metaHTML(t)}
           <span class="badge done">done</span>
         </div>
+        ${outputDirHTML(t)}
       </div>
     `).join('');
   id('failed-list').innerHTML = failed.length === 0
@@ -650,6 +664,7 @@ function renderDoneList() {
           <span class="task-meta" title="${escHtml(t.last_error || '')}">${escHtml((t.last_error || '').slice(0,60))}</span>
           <button class="btn-ghost btn-sm" onclick="retryTask(${t.id})">Retry</button>
         </div>
+        ${outputDirHTML(t)}
       </div>
     `).join('');
 }
@@ -672,6 +687,7 @@ function taskCardHTML(t) {
           <button class="btn-ghost btn-sm" onclick="viewLogs(${t.id})">Logs</button>
         </div>
       </div>
+      ${outputDirHTML(t)}
       ${streamsHTML}
     </div>
   `;
@@ -802,8 +818,12 @@ function viewLogs(task_id) {
 function doEnqueue() {
   const url = id('enqueue-url').value.trim();
   if (!url) return;
-  sendCmd({cmd: 'enqueue', url});
-  appendLog({level:'INFO', ts: new Date().toISOString(), task_id:null, msg:`Enqueueing: ${url}`});
+  const outputDir = id('enqueue-output-dir').value.trim();
+  const payload = {cmd: 'enqueue', url};
+  if (outputDir) payload.output_dir = outputDir;
+  sendCmd(payload);
+  const msg = `Enqueueing: ${url}${outputDir ? ` → ${outputDir}` : ''}`;
+  appendLog({level:'INFO', ts: new Date().toISOString(), task_id:null, msg});
 }
 
 function skipTask(task_id) {
@@ -824,6 +844,9 @@ id('btn-pause').addEventListener('click', () => {
 });
 
 id('enqueue-url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doEnqueue();
+});
+id('enqueue-output-dir').addEventListener('keydown', e => {
   if (e.key === 'Enter') doEnqueue();
 });
 

@@ -255,11 +255,22 @@ async def cmd_status(args, config) -> None:
 
 
 async def cmd_enqueue(args, config) -> None:
+    output_dir: str | None = None
+    if args.output_dir:
+        # Resolve client-side so the daemon sees an unambiguous absolute path.
+        # The daemon re-validates existence + writability + free space on the
+        # machine it actually runs on, which may differ from this one.
+        output_dir = str(Path(args.output_dir).expanduser().resolve())
+
     for url in args.url:
-        reply = await _send_recv(_ws_url(config), {"cmd": "enqueue", "url": url})
+        payload: dict[str, Any] = {"cmd": "enqueue", "url": url}
+        if output_dir:
+            payload["output_dir"] = output_dir
+        reply = await _send_recv(_ws_url(config), payload)
         if reply.get("ok"):
             ids = reply.get("task_ids", [])
-            print(f"Enqueued {reply.get('enqueued')} task(s): {ids}  ← {url}")
+            suffix = f"  → {output_dir}" if output_dir else ""
+            print(f"Enqueued {reply.get('enqueued')} task(s): {ids}  ← {url}{suffix}")
         else:
             print(f"Error for {url}: {reply.get('error')}", file=sys.stderr)
 
@@ -339,6 +350,8 @@ async def cmd_show(args, config) -> None:
         print(f"  {label:11s} : {pretty}")
     print(f"  attempts    : {t.get('attempts', 0)}")
     print(f"  output size : {_fmt_bytes(t.get('output_size_bytes')) or '—'}")
+    if t.get("output_dir"):
+        print(f"  output_dir  : {t['output_dir']}  (custom)")
     if t.get("mkv_path"):
         print(f"  mkv         : {t['mkv_path']}")
     if t.get("last_error"):
@@ -587,6 +600,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # enqueue
     p = sub.add_parser("enqueue", help="Enqueue one or more item URLs from the target site.")
     p.add_argument("url", nargs="+", help="Item URL(s) on the configured target site.")
+    p.add_argument("-o", "--output-dir", dest="output_dir", metavar="PATH", default=None,
+                   help="Write this task's output (MKV, metadata, thumbnails, subtitles) "
+                        "under PATH instead of the daemon-wide `output_dir` config. "
+                        "Use this to drop content directly into a Plex library directory. "
+                        "Applies to every URL in this invocation.")
 
     # list
     p = sub.add_parser("list", help="List tasks in the queue.")

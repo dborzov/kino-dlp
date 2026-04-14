@@ -2,7 +2,7 @@
 
 > One-line summary: implementation rationale — why the code looks the way it does, and the gotchas that will bite future contributors.
 >
-> Last updated: 2026-04-13
+> Last updated: 2026-04-14
 
 For the user-facing behavior see [spec.md](spec.md). For the system map see
 [architecture.md](architecture.md). This doc is for anyone changing the code.
@@ -69,6 +69,85 @@ The `tasks` table has `UNIQUE(item_id, season, episode)` to dedupe re-enqueues. 
 Solution: movies use `season=0, episode=1` as sentinel values. Both columns are declared `NOT NULL`. The UNIQUE constraint then catches duplicate movie enqueues.
 
 If you later want season=0 to mean "specials" for series, pick a different sentinel for movies (e.g. `-1`) rather than collide.
+
+## Per-task `output_dir` + filesystem guards
+
+The final-output root used to be hard-coded to `config.output_dir`. That's
+fine for a single user who only downloads into one library, but it forces
+any "drop this into my Plex TV Shows folder" workflow to mutate the global
+config, which then affects every *other* queued task too. The fix: one
+nullable `tasks.output_dir` column and an optional `--output-dir` flag on
+`enqueue`. `None` = use the config default, which is the long-standing
+behaviour.
+
+### Why a helper (`task_output_root`) and not `task.output_dir or config.output_dir`
+
+Lots of code paths need the effective root: mkv_path computation, scaffold
+call, sub sidecar path, `add_sub_to_task`, etc. Spreading `task.get("output_dir") or config.output_dir` across all of them is a recipe for
+the CLI-override fix being "mostly implemented". `downloader.task_output_root(task, config)` is one line, does the `~` expansion, and is imported by
+every site that needs it. If a future column participates in the resolution
+(e.g. a relative subdir), there's one place to change.
+
+### Validation in three checkpoints, not one
+
+A single enqueue-time check is not enough:
+
+1. **At enqueue** (ws_server `CMD_ENQUEUE`): `validate_task_output_dir`
+   fires *before* `scrape()` and before any DB write. Failure → WS error, no
+   task, no poster, no `.info.json`. The motivation is an AI agent mis-typing
+   `/mtn/plex` — you don't want the error to surface after a minute of
+   scraping and thumbnail downloads that end up in the wrong place. The
+   validator auto-creates missing directories only when the *parent* exists
+   and is writable, which gives the user typo-catching for free.
+2. **At task start** (top of `download_task`): re-resolve and re-validate.
+   Between enqueue and the moment a worker claims the task, the disk could
+   be unmounted, the directory renamed, or permissions tightened. Without
+   this check the worker crashes mid-download with a raw `OSError`; with it
+   the task transitions to `failed` with a one-line `last_error` the UI
+   can render.
+3. **Mid-download**: `TaskFSError` wraps `OSError` with the operation name
+   and the path at the three fragile sites (work-dir `mkdir`, merged-MKV
+   write, sidecar write). `worker_task`'s existing `except Exception` hook
+   turns this into a readable `last_error` — `writing merged MKV to
+   /mnt/plex/foo.mkv: No space left on device` beats `[Errno 28] ENOSPC`.
+
+### Why the free-space check is advisory, not atomic
+
+`shutil.disk_usage(path).free` gives a snapshot. Two workers can both pass
+the check and then race for the last few GB during a simultaneous merge —
+that's the TaskFSError handler's job. Making the check atomic would require
+a reservation table that is cleaned up on every task exit, including
+crashes, which is way more state than it's worth.
+
+The check uses `estimate_min_free_gb(duration_sec, base_min_gb)` which
+returns `max(base_min_gb, int(duration_sec/3600 * 3) + 2)` — a conservative
+3 GB/hour floor plus 2 GB overhead. For a 10-hour season that's 32 GB,
+which is roughly what a 1080p rip takes. At enqueue time `duration_sec` is
+unknown so the check falls back to `min_free_space_gb` from config; at task
+start (after manifest parse) the refined estimate fires a second time.
+
+### Re-enqueue conflict: fail, don't silently ignore
+
+`db_insert_task` uses `INSERT OR IGNORE` on `UNIQUE(item_id, season,
+episode)`, so re-enqueueing the same episode is a no-op. But with the new
+feature that means a re-enqueue with a *different* `--output-dir` would
+silently keep the original and ignore the new path. An AI agent scripted
+against scrap-pub would have no way to tell whether `--output-dir` was
+honoured. `_enqueue_url` now explicitly checks for existing matching rows
+*before* insert and raises a `ValueError` naming the existing task id if
+the new and old `output_dir` differ. `INSERT OR IGNORE` is still used
+afterwards so the no-conflict case is still idempotent.
+
+### Why not move `add_sub_to_task`'s sidecar into `config.output_dir` regardless
+
+Tempting — "subtitles always live under the daemon default, tasks are
+mutable, done" — but wrong. The whole point of `--output-dir` is that a
+Plex scanner watching `/mnt/plex/TV Shows` sees a coherent tree. A sidecar
+that landed under the default `~/output` would be ignored by the scanner
+and silently orphaned. `add_sub_to_task` reloads the task row and calls
+`task_output_root(task, config)` just like the initial download path does.
+
+---
 
 ## SQLite UNIQUE + COALESCE — must be a separate index
 

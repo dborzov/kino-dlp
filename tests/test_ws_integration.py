@@ -303,6 +303,110 @@ async def test_enqueue_missing_url(ws_server):
     assert "url" in reply["error"]
 
 
+# ── CMD_ENQUEUE output_dir validation surface ────────────────────────────────
+#
+# These cases hit only the pre-scrape validation path in the CMD_ENQUEUE
+# dispatch, so they don't need a real network request to the target site.
+
+
+@pytest.mark.asyncio
+async def test_enqueue_output_dir_must_be_string(ws_server):
+    state, url = ws_server
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/1/s0e1",
+        "output_dir": ["not", "a", "string"],
+    })
+    assert reply["ok"] is False
+    assert "output_dir" in reply["error"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_output_dir_parent_missing(ws_server, tmp_path):
+    state, url = ws_server
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/1/s0e1",
+        "output_dir": str(tmp_path / "typo" / "plex"),
+    })
+    assert reply["ok"] is False
+    assert "parent does not exist" in reply["error"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_output_dir_not_writable(ws_server, tmp_path):
+    state, url = ws_server
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        reply = await _cmd(url, {
+            "cmd": "enqueue",
+            "url": "https://example.com/item/view/1/s0e1",
+            "output_dir": str(locked),
+        })
+        assert reply["ok"] is False
+        assert "not writable" in reply["error"]
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_output_dir_low_free_space(ws_server, tmp_path, monkeypatch):
+    """Raise min_free_space_gb above actual free, confirm enqueue errors out."""
+    state, url = ws_server
+    state.config.min_free_space_gb = 999999  # definitely bigger than any test volume
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/1/s0e1",
+        "output_dir": str(tmp_path),
+    })
+    assert reply["ok"] is False
+    assert "insufficient free space" in reply["error"]
+
+
+# ── _find_conflicting_task (unit test, via direct import) ────────────────────
+#
+# The re-enqueue conflict guard: inserting a second row for the same
+# (item_id, season, episode) with a different output_dir must be caught and
+# reported explicitly rather than silently keeping the original path.
+
+
+def test_find_conflicting_task_detects_different_output_dir(db, tmp_path):
+    from scrap_pub.daemon.ws_server import _find_conflicting_task
+
+    db_upsert_item(db, {
+        "id": "900", "kind": "movie",
+        "title_orig": "Test", "title_ru": None,
+        "year": 2026, "url": "https://example.com/item/view/900",
+        "poster_url": None, "meta_json": "{}",
+    })
+    tid = db_insert_task(db,
+        item_id="900", kind="movie",
+        season=0, episode=1,
+        episode_title=None, media_id="m1",
+        plex_stem="Test(2026)/Test(2026)",
+        output_dir=str(tmp_path / "first"),
+    )
+    # Same output_dir → no conflict
+    assert _find_conflicting_task(db, "900", 0, 1, str(tmp_path / "first")) is None
+    # Different output_dir → conflict carrying the existing id
+    conflict = _find_conflicting_task(db, "900", 0, 1, str(tmp_path / "second"))
+    assert conflict is not None
+    assert conflict["id"] == tid
+    assert conflict["output_dir"] == str(tmp_path / "first")
+    # No output_dir on the new request but the existing row has one → also a conflict
+    conflict2 = _find_conflicting_task(db, "900", 0, 1, None)
+    assert conflict2 is not None
+    assert conflict2["id"] == tid
+
+
+def test_find_conflicting_task_none_when_empty(db):
+    from scrap_pub.daemon.ws_server import _find_conflicting_task
+    assert _find_conflicting_task(db, "nonexistent", 0, 1, None) is None
+    assert _find_conflicting_task(db, "nonexistent", 0, 1, "/mnt/plex") is None
+
+
 # ── CMD_GET ────────────────────────────────────────────────────────────────────
 
 

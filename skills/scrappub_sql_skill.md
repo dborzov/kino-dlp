@@ -102,6 +102,7 @@ affinity rules — treat them as hints.
 | `started_at` | TEXT | ISO-8601 UTC (rewritten on every claim; `NULL` after retry until re-claimed) |
 | `completed_at` | TEXT | ISO-8601 UTC for `done`/`failed`/`skipped`; cleared on retry |
 | `mkv_path` | TEXT | Absolute output path once the task finishes |
+| `output_dir` | TEXT | Per-task output root override; `NULL` means "use `config.output_dir`". When set, the MKV, poster, `.info.json`, thumbnails, and subtitle sidecars all land under `output_dir/plex_stem` instead of the daemon default. Added by the per-task override feature — on legacy DBs this column is migrated in by `open_db()` on first startup. |
 
 Unique constraint: `(item_id, season, episode)` — retrying is idempotent.
 Indexes: `status`, `item_id`, `enqueued_at`, `completed_at`.
@@ -181,6 +182,34 @@ WHERE t.status = 'done'
 GROUP BY t.id
 ORDER BY total_bytes DESC
 LIMIT 10;
+```
+
+### Tasks with a custom output directory (per-task override)
+
+```sql
+-- Every task that was enqueued with --output-dir
+SELECT id, status, plex_stem, output_dir
+FROM tasks
+WHERE output_dir IS NOT NULL
+ORDER BY id DESC;
+
+-- Group by output root so you can see which libraries the daemon has been
+-- feeding, and how many tasks each got
+SELECT COALESCE(output_dir, '<default: config.output_dir>') AS root,
+       COUNT(*) AS n,
+       SUM(CASE WHEN status='done'    THEN 1 ELSE 0 END) AS done,
+       SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END) AS failed
+FROM tasks
+GROUP BY root
+ORDER BY n DESC;
+
+-- Tasks targeting a specific Plex library — use LIKE so the trailing slash
+-- and subdir variants all match
+SELECT id, status, plex_stem
+FROM tasks
+WHERE output_dir LIKE '/mnt/plex/TV Shows%'
+ORDER BY enqueued_at DESC;
 ```
 
 ### Show all streams for a given task

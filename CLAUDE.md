@@ -149,15 +149,27 @@ All output paths use the **original-language title** (French for French films, E
 shows, Russian for Russian shows) from the target site's `og:title`. The helpers live inline in
 `scrap_pub/daemon/scraper.py`.
 
+The output **root** is `config.output_dir` by default, but every task can
+override it with `scrap-pub enqueue URL --output-dir PATH`. The inside-the-
+root layout is identical either way — the override only swaps the top level.
+Use this to drop content directly into a Plex library directory (or any other
+media-server watched folder) without mutating the daemon-wide config. The
+per-task override is stored on `tasks.output_dir` and persists across daemon
+restarts. **Never** `config --set output_dir=...` as a workaround for a
+single task — that changes the default for every other queued task too.
+
 ```
-# Movie
+# Movie (default root)
 output/Hoppers(2026)/Hoppers(2026).mkv
 
-# TV episode
+# TV episode (default root)
 output/Big Mistakes(2026)/Season 01/Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.mkv
 
 # Sidecar subtitles (same dir as MKV)
 output/Big Mistakes(2026)/Season 01/Big Mistakes(2026) - s01e01 - Get Your Nonna a Necklace.rus.srt
+
+# Per-task override: scrap-pub enqueue URL --output-dir "/mnt/plex/TV Shows"
+/mnt/plex/TV Shows/Big Mistakes(2026)/Season 01/...
 ```
 
 See `docs/docs.md` for the docs index.
