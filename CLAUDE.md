@@ -63,6 +63,10 @@ scrap-pub list --since week --verbose
 scrap-pub show 42
 scrap-pub sql "SELECT id, status FROM tasks ORDER BY id DESC LIMIT 10"
 
+# Local path lookup (no daemon required)
+scrap-pub paths               # prints output/tmp/db/cookies/config/website
+scrap-pub paths output        # just the output dir — for `cd $(scrap-pub paths output)`
+
 # Install a new package
 uv add <package>          # adds to pyproject.toml + syncs
 uv add --dev <package>    # dev dependency

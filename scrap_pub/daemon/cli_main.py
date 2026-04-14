@@ -22,6 +22,7 @@ Usage:
     scrap-pub add-audio TASK_ID URL [--label LABEL]
     scrap-pub add-sub   TASK_ID URL [--lang LANG]
     scrap-pub config [--set KEY=VALUE]
+    scrap-pub paths [KEY]           # echo resolved paths from config (no daemon needed)
 """
 
 import argparse
@@ -508,6 +509,37 @@ async def cmd_add_sub(args, config) -> None:
     print(f"Subtitle stream {reply.get('stream_id')} queued for task {args.task_id}.")
 
 
+# ── paths (local, no daemon) ──────────────────────────────────────────────────
+
+# Keys surfaced by `scrap-pub paths`. Maps a short user-facing name to the
+# Config attribute that resolves to the value. Each value is printed as-is
+# (paths expanded, no trailing newline beyond print()'s) so `cd $(scrap-pub
+# paths output)` and friends work in shell.
+_PATH_KEYS: dict[str, str] = {
+    "output":  "output_dir",
+    "tmp":     "tmp_dir",
+    "db":      "db_path",
+    "cookies": "cookies_path",
+    "config":  "_cfg_path",
+    "website": "website",
+}
+
+
+def cmd_paths(args, config) -> None:
+    if args.key:
+        attr = _PATH_KEYS.get(args.key)
+        if attr is None:
+            _die(
+                f"unknown key {args.key!r}. "
+                f"Valid keys: {', '.join(_PATH_KEYS)}"
+            )
+        print(getattr(config, attr))
+        return
+    width = max(len(k) for k in _PATH_KEYS)
+    for key, attr in _PATH_KEYS.items():
+        print(f"{key.ljust(width)}  {getattr(config, attr)}")
+
+
 async def cmd_config(args, config) -> None:
     if args.set:
         # Parse KEY=VALUE pairs
@@ -644,6 +676,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--set", nargs="+", metavar="KEY=VALUE",
                    help="Set one or more config keys (value parsed as JSON).")
 
+    # paths (local lookup, no daemon required)
+    p = sub.add_parser(
+        "paths",
+        help="Print config-resolved paths (output, tmp, db, cookies, config, website).",
+        description=(
+            "Echo paths resolved from the local config file. Runs without the "
+            "daemon. With no KEY, prints every entry as `key  value`. With a "
+            "KEY, prints just that value — useful for shell substitution, "
+            "e.g. `cd $(scrap-pub paths output)`."
+        ),
+    )
+    p.add_argument(
+        "key",
+        nargs="?",
+        choices=list(_PATH_KEYS),
+        metavar="KEY",
+        help="One of: " + ", ".join(_PATH_KEYS) + ". Omit to list all.",
+    )
+
     return parser
 
 
@@ -662,6 +713,7 @@ _HANDLERS = {
     "add-audio": cmd_add_audio,
     "add-sub":   cmd_add_sub,
     "config":    cmd_config,
+    "paths":     cmd_paths,
 }
 
 
@@ -677,7 +729,11 @@ def main() -> None:
         _die(f"unknown subcommand: {args.subcmd!r}")
 
     try:
-        asyncio.run(handler(args, config))
+        result = handler(args, config)
+        # Handlers that talk to the daemon are async coroutines; purely local
+        # ones (e.g. `paths`) are plain functions that already ran above.
+        if asyncio.iscoroutine(result):
+            asyncio.run(result)
     except ConnectionRefusedError:
         _die(
             f"cannot connect to ws://localhost:{config.ws_port} — "

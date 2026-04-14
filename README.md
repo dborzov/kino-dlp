@@ -162,6 +162,12 @@ scrap-pub config
 scrap-pub config --set concurrency=4
 scrap-pub config --set video_quality=highest
 scrap-pub config --set output_dir="/mnt/plex/movies"
+
+# Paths — echo resolved paths from config (works without the daemon)
+scrap-pub paths                  # list output/tmp/db/cookies/config/website
+scrap-pub paths output           # just the value, for shell substitution
+cd "$(scrap-pub paths output)"   # jump to the download directory
+ls  "$(scrap-pub paths tmp)"     # peek at ffmpeg's working files
 ```
 
 `scrap-pub list` accepts `--status`, `--kind`, `--since`, `--until`,

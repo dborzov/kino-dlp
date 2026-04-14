@@ -34,6 +34,52 @@ with `uv run` (e.g. `uv run scrap-pub status`).
 
 ---
 
+## Finding file paths (agents: read this first)
+
+You likely don't know where this user's installation writes its files — the
+paths are all driven by `~/.config/scrap-pub/config.json` and differ per
+machine. **Do not guess** `./output`, `./tmp`, or `~/Downloads/...` — ask the
+CLI.
+
+`scrap-pub paths` runs locally against the config file and does **not**
+require the daemon to be running. Use it any time you need to open, `cd`,
+`ls`, grep, or attach to a downloaded file.
+
+```bash
+# Show every path at once (output, tmp, db, cookies, config, website)
+scrap-pub paths
+
+# Echo a single value — ideal for shell substitution
+scrap-pub paths output      # /home/user/media/plex
+scrap-pub paths tmp         # /var/tmp/scrap-pub
+scrap-pub paths cookies     # ~/.config/scrap-pub/cookies.txt
+scrap-pub paths db          # ~/.local/share/scrap-pub/queue.db
+scrap-pub paths config      # path to the config.json currently in effect
+scrap-pub paths website     # https://example.com (base URL of the target site)
+```
+
+Typical agent recipes:
+
+```bash
+# Go look at a finished MKV
+cd "$(scrap-pub paths output)" && ls -lh
+
+# Inspect ffmpeg's in-progress working files for task 42
+ls -lh "$(scrap-pub paths tmp)"
+
+# Open the SQLite queue DB directly (read-only)
+sqlite3 "$(scrap-pub paths db)" "SELECT id, status, plex_stem FROM tasks ORDER BY id DESC LIMIT 10;"
+
+# Show the full config (including any keys not in the table below)
+cat "$(scrap-pub paths config)"
+```
+
+For downloaded-file paths **per task**, prefer `scrap-pub show TASK_ID` — its
+`mkv` line is the absolute path to the finished file. That value is already
+an absolute path, so you don't need to join it with `paths output` yourself.
+
+---
+
 ## Daemon Control (CLI)
 
 All CLI commands are short-lived WebSocket connections to the daemon. The daemon must be

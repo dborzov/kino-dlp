@@ -26,6 +26,20 @@ scrap-pub sql "UPDATE ..." --write             # escape hatch for DML/DDL
 The daemon must be running — SQL goes over the same WebSocket channel as every
 other command.
 
+If the daemon is **not** running and you need to inspect the queue DB
+directly (read-only), use the local path-lookup CLI, which works without a
+daemon:
+
+```bash
+sqlite3 -readonly "$(scrap-pub paths db)" \
+    "SELECT id, status, plex_stem FROM tasks ORDER BY id DESC LIMIT 10;"
+```
+
+Note that the daemon holds a WAL writer lock while running; reading the DB
+file directly while the daemon is up is safe (WAL mode) but writes from
+outside the daemon are not. Prefer `scrap-pub sql` whenever the daemon is
+available.
+
 ### Safety gate
 
 By default the server strips SQL comments, looks at the first statement token,

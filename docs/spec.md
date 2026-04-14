@@ -204,6 +204,18 @@ scrap-pub add-sub TASK_ID URL [--lang LANG]
 
 scrap-pub config [--set KEY=VALUE ...]
     Show current config or update one or more keys.
+
+scrap-pub paths [KEY]
+    Print paths resolved from the local config file. Runs WITHOUT the
+    daemon — reads ~/.config/scrap-pub/config.json directly and echoes the
+    expanded values. With no KEY, prints every entry as `key  value`.
+    With a KEY, prints just that value so it can be used in shell
+    substitution: `cd $(scrap-pub paths output)`, `ls $(scrap-pub paths tmp)`,
+    `sqlite3 $(scrap-pub paths db) ...`.
+      KEY : output | tmp | db | cookies | config | website
+    This is the recommended way for AI agents and scripts to discover where
+    downloaded files, working files, the queue DB, and the cookies file live
+    on this specific installation — do not hard-code `./output` or `./tmp`.
 ```
 
 ---
