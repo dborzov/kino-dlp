@@ -1,16 +1,23 @@
 # scrap-pub
 
-Download daemon and CLI for kino-style, on-demand video websites. Add links to its queue
-from the target site; the daemon then scrapes metadata, downloads HLS streams via ffmpeg,
-and assembles Plex-ready MKV files with embedded audio tracks and sidecar subtitles in a
-way that simulates live user traffic and doesn't raise any flags (Cloudflare bot check or
-otherwise).
 
-> **Note:** this project ships with no default target site. It is a generic toolkit for the
-> category of kino-style, on-demand video websites. Whether you point it at a particular
-> site, and your compliance with that site's terms of service, is entirely your own
-> responsibility. See [Configuration](#configuration) — the `website` config key is
-> empty by default and you must set it yourself.
+Downloader for kino-style, on-demand video websites. You know the ones I mean.
+
+![Img](./docs/screenshots/screenshot.png)
+
+
+What it can do:
+* Add links from the target site to the download queue;
+* Get video content downloaded from a HLS/m3u stream on the link;
+* Can use your login credentials;
+* Handles and packs in into the final local MKV video file ready for your local media server;
+* Lets you specify as a general policy for quality, audiotrack langauge preferences, subtitles preferences;
+* Get the MKV Plex- and other media server-friendly local metadata files with the things like poster/thumbnail, description, the year of release and genre etc;
+* Does all the reasonable things of recovering if things go wrong,  simulating live user traffic so as not to raise any flags etc;
+* websocket service + webUI + cli commands;
+
+
+Let your AI agent handle all this. Just point it to the [SKILL files](./skills).
 
 
 ---
