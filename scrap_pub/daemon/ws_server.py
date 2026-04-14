@@ -307,9 +307,27 @@ async def dispatch(msg: dict, state) -> dict:
         url = msg.get("url", "").strip()
         if not url:
             return reply_err(cmd, "missing 'url'")
+        raw_output_dir = msg.get("output_dir")
+        if isinstance(raw_output_dir, str):
+            raw_output_dir = raw_output_dir.strip() or None
+        elif raw_output_dir is not None:
+            return reply_err(cmd, "'output_dir' must be a string")
+
+        resolved_output_dir: str | None = None
+        if raw_output_dir:
+            from .config import OutputDirError, validate_task_output_dir
+            try:
+                resolved = validate_task_output_dir(
+                    raw_output_dir, state.config.min_free_space_gb
+                )
+            except OutputDirError as e:
+                return reply_err(cmd, str(e))
+            resolved_output_dir = str(resolved)
+
         try:
-            task_ids = await _enqueue_url(url, state)
-            return reply_ok(cmd, enqueued=len(task_ids), task_ids=task_ids)
+            task_ids = await _enqueue_url(url, state, output_dir=resolved_output_dir)
+            return reply_ok(cmd, enqueued=len(task_ids), task_ids=task_ids,
+                            output_dir=resolved_output_dir)
         except Exception as e:
             return reply_err(cmd, str(e))
 
@@ -416,11 +434,20 @@ async def dispatch(msg: dict, state) -> dict:
         return reply_err(cmd or "?", f"unknown command: {cmd!r}")
 
 
-async def _enqueue_url(url: str, state) -> list[int]:
+async def _enqueue_url(
+    url: str,
+    state,
+    *,
+    output_dir: str | None = None,
+) -> list[int]:
     """
     Scrape an item URL on the configured target site and create task rows.
     Returns list of newly created task IDs.
     Runs the synchronous scraper in net_executor.
+
+    If `output_dir` is provided it is used as the per-task output root in
+    place of `state.config.output_dir` — including the scaffold() call that
+    writes poster / thumbnail / metadata files before any task row exists.
     """
     import re
 
@@ -441,8 +468,25 @@ async def _enqueue_url(url: str, state) -> list[int]:
     # Store item
     await db_run(state, db_upsert_item, state.conn, info)
 
-    # Scaffold dirs (poster, thumbnails, info.json)
-    await net_run(state, scaffold, info, state.config.output_dir)
+    # Effective output root for scaffolding + every task row we're about to
+    # create. Poster/thumbnail/metadata must land in the same place the final
+    # MKV will, so the Plex library sees one coherent tree.
+    effective_root = Path(output_dir).expanduser() if output_dir else Path(state.config.output_dir)
+
+    # Guard against re-enqueue with a conflicting output_dir. INSERT OR IGNORE
+    # would silently keep the original, so a Plex agent would have no idea
+    # the new --output-dir was ignored.
+    conflict = await db_run(state, _find_conflicting_task, state.conn,
+                            item_id, req_season, req_episode, output_dir)
+    if conflict is not None:
+        raise ValueError(
+            f"task {conflict['id']} already exists for this item with a different "
+            f"output_dir ({conflict['output_dir'] or '<default>'}). "
+            "Delete it first, then re-enqueue."
+        )
+
+    # Scaffold dirs (poster, thumbnails, info.json) into the EFFECTIVE root.
+    await net_run(state, scaffold, info, effective_root)
 
     title  = canonical_title(info)
     year   = info.get("year")
@@ -457,6 +501,7 @@ async def _enqueue_url(url: str, state) -> list[int]:
             season=me.get("season", 0), episode=me.get("episode", 1),
             episode_title=None, media_id=me.get("media_id"),
             plex_stem=plex_stem,
+            output_dir=output_dir,
         )
         if tid:
             task_ids.append(tid)
@@ -477,11 +522,45 @@ async def _enqueue_url(url: str, state) -> list[int]:
                     episode_title=ep.get("title"),
                     media_id=ep.get("media_id"),
                     plex_stem=plex_stem,
+                    output_dir=output_dir,
                 )
                 if tid:
                     task_ids.append(tid)
 
     return task_ids
+
+
+def _find_conflicting_task(
+    conn,
+    item_id: str,
+    req_season: int | None,
+    req_episode: int | None,
+    new_output_dir: str | None,
+) -> dict | None:
+    """Return the first existing task row whose output_dir differs from new_output_dir.
+
+    Covers both movies (single row) and the general series case (all matching
+    episodes). Returns None when no conflict exists — either no row, or all
+    matching rows already carry the same output_dir so INSERT OR IGNORE is
+    the correct no-op.
+    """
+    clauses = ["item_id = ?"]
+    params: list = [item_id]
+    if req_season is not None:
+        clauses.append("season = ?")
+        params.append(req_season)
+    if req_episode is not None:
+        clauses.append("episode = ?")
+        params.append(req_episode)
+    rows = conn.execute(
+        f"SELECT id, output_dir FROM tasks WHERE {' AND '.join(clauses)}",
+        params,
+    ).fetchall()
+    for r in rows:
+        existing = r["output_dir"]
+        if (existing or None) != (new_output_dir or None):
+            return {"id": r["id"], "output_dir": existing}
+    return None
 
 
 async def serve_ws(state) -> None:

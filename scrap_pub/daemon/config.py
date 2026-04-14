@@ -8,6 +8,7 @@ Config file location (in priority order):
 """
 
 import json
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,10 @@ class Config:
     video_quality: str = "lowest"     # "lowest" | "highest" | "720p" | "1080p"
     audio_langs: list[str] = field(default_factory=lambda: ["RUS", "ENG", "FRE"])
     sub_langs:   list[str] = field(default_factory=lambda: ["rus", "eng", "fra"])
+    # Advisory floor for free space on a task's output filesystem. The check is
+    # not atomic across concurrent workers — it's a guard against enqueueing
+    # into a nearly-full disk, not a per-task size reservation.
+    min_free_space_gb: int = 10
 
     # Internal: path this config was loaded from / should be saved to.
     # Not serialised — excluded from to_dict() and asdict() via field(repr=False).
@@ -158,5 +163,104 @@ class Config:
             errors.append(
                 f"`stall_timeout_sec` must be >= 1 (got {self.stall_timeout_sec})."
             )
+        if self.min_free_space_gb < 0:
+            errors.append(
+                f"`min_free_space_gb` must be >= 0 (got {self.min_free_space_gb})."
+            )
 
         return errors, warnings
+
+
+# ── Per-task output dir validation ────────────────────────────────────────────
+
+class OutputDirError(ValueError):
+    """Raised when a task-level output directory is unusable."""
+
+
+def validate_task_output_dir(path: str | Path, min_free_gb: int) -> Path:
+    """Resolve and validate a per-task output directory.
+
+    Returns the resolved absolute Path on success. Raises `OutputDirError`
+    with a human-readable message on failure — callers can surface `str(exc)`
+    directly in the WS reply / task `last_error`.
+
+    Behaviour:
+      - Expands `~` and resolves to an absolute path.
+      - If the directory does not exist, creates it when the parent exists
+        and is writable. Fails loudly if the parent is missing (catches typos
+        like `/mtn/plex`).
+      - Fails if the path exists but is not a directory.
+      - Runs a write-probe (create + unlink a sentinel file).
+      - Checks `shutil.disk_usage(path).free >= min_free_gb * GiB`.
+    """
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve(strict=False)
+    except OSError as e:
+        raise OutputDirError(f"cannot resolve output directory {p}: {e.strerror or e}") from e
+
+    if not p.exists():
+        parent = p.parent
+        if not parent.exists():
+            raise OutputDirError(
+                f"output directory parent does not exist: {parent} "
+                "(typo?). Create the parent first, then retry."
+            )
+        if not parent.is_dir():
+            raise OutputDirError(
+                f"output directory parent is not a directory: {parent}"
+            )
+        try:
+            p.mkdir(parents=False, exist_ok=True)
+        except PermissionError as e:
+            raise OutputDirError(
+                f"cannot create output directory {p}: permission denied on {parent}"
+            ) from e
+        except OSError as e:
+            raise OutputDirError(
+                f"cannot create output directory {p}: {e.strerror or e}"
+            ) from e
+    elif not p.is_dir():
+        raise OutputDirError(f"output path is not a directory: {p}")
+
+    probe = p / ".scrap-pub-write-probe"
+    try:
+        probe.write_text("ok")
+        probe.unlink()
+    except PermissionError as e:
+        raise OutputDirError(
+            f"output directory is not writable: {p} (permission denied)"
+        ) from e
+    except OSError as e:
+        raise OutputDirError(
+            f"output directory is not writable: {p} ({e.strerror or e})"
+        ) from e
+
+    try:
+        free = shutil.disk_usage(p).free
+    except OSError as e:
+        raise OutputDirError(
+            f"cannot stat filesystem at {p}: {e.strerror or e}"
+        ) from e
+    min_bytes = min_free_gb * 1024**3
+    if free < min_bytes:
+        free_gb = free / 1024**3
+        raise OutputDirError(
+            f"insufficient free space at {p}: "
+            f"{free_gb:.1f} GB free, need at least {min_free_gb} GB"
+        )
+
+    return p
+
+
+def estimate_min_free_gb(duration_sec: int | None, base_min_gb: int) -> int:
+    """Refine the free-space floor using an estimated episode duration.
+
+    Uses a rough ~3 GB/hour bitrate heuristic plus a 2 GB safety margin, then
+    takes the maximum with the configured base floor. Returns an integer GB
+    count suitable for passing back into `validate_task_output_dir`.
+    """
+    if not duration_sec or duration_sec <= 0:
+        return base_min_gb
+    estimated = int((duration_sec / 3600) * 3) + 2
+    return max(base_min_gb, estimated)

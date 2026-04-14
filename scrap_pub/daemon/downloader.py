@@ -15,6 +15,12 @@ add_sub_to_task(task_id, url, lang, state)
 import shutil
 from pathlib import Path
 
+from .config import (
+    Config,
+    OutputDirError,
+    estimate_min_free_gb,
+    validate_task_output_dir,
+)
 from .db import (
     db_get_item,
     db_get_streams,
@@ -50,6 +56,42 @@ MAX_ATTEMPTS = 3
 # Fields captured into AppState.stream_progress so CLI list/show can read live
 # telemetry without hitting the DB on every ffmpeg tick.
 _LIVE_FIELDS = ("pct", "speed", "eta_sec", "elapsed_sec", "size_bytes")
+
+
+class TaskFSError(RuntimeError):
+    """Filesystem error during a task, tagged with path + operation.
+
+    Wrap raw OSError with this so the worker-level `except Exception` surfaces
+    a message that tells the reviewer *which operation failed and where*,
+    rather than a bare `[Errno 28] No space left on device`.
+    """
+
+    def __init__(self, op: str, path: Path, cause: OSError):
+        msg = f"{op} {path}: {cause.strerror or cause}"
+        super().__init__(msg)
+        self.op = op
+        self.path = path
+        self.cause = cause
+
+
+def task_output_root(task: dict, config: Config) -> Path:
+    """Resolve the effective output root for a task.
+
+    If the task row carries a non-empty `output_dir`, that wins (per-task
+    override). Otherwise fall back to the daemon-wide `config.output_dir`.
+    """
+    raw = task.get("output_dir") if isinstance(task, dict) else None
+    if raw:
+        return Path(raw).expanduser()
+    return Path(config.output_dir)
+
+
+def _safe_mkdir(path: Path, op: str) -> None:
+    """mkdir(parents=True, exist_ok=True) wrapped in TaskFSError for context."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise TaskFSError(op, path, e) from e
 
 
 def _emit_progress(state, msg: dict) -> None:
@@ -89,8 +131,22 @@ async def download_task(task: dict, state) -> None:
 
     log("INFO", f"Starting task — {task.get('plex_stem') or task.get('episode_title') or task['kind']}")
 
-    # ── 0. Check if output already exists ─────────────────────────────────────
-    mkv_path = Path(config.output_dir) / f"{task['plex_stem']}.mkv"
+    # ── 0a. Resolve + re-validate the effective output root ──────────────────
+    # The dir may have been unmounted / chmod'd / run out of space between
+    # enqueue and claim. Re-probe here so we fail fast with a clear message
+    # instead of crashing mid-ffmpeg.
+    output_root = task_output_root(task, config)
+    try:
+        output_root = validate_task_output_dir(output_root, config.min_free_space_gb)
+    except OutputDirError as e:
+        log("ERROR", f"Output directory unusable: {e}")
+        await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+        await broadcast(state, {"type": EVT_TASK_UPDATE, "task_id": task_id,
+                                "status": "failed", "error": str(e)})
+        return
+
+    # ── 0b. Check if output already exists ────────────────────────────────────
+    mkv_path = output_root / f"{task['plex_stem']}.mkv"
     if mkv_path.exists() and mkv_path.stat().st_size > 0:
         log("INFO", f"Output already exists: {mkv_path.name}")
         await db_run(state, db_set_task_status, conn, task_id, "done",
@@ -150,15 +206,32 @@ async def download_task(task: dict, state) -> None:
 
     # ── 4. Scaffold Plex dirs ─────────────────────────────────────────────────
     try:
-        await net_run(state, scaffold, item_from_meta(item), config.output_dir)
+        await net_run(state, scaffold, item_from_meta(item), output_root)
     except Exception as e:
         log("WARN", f"Scaffold error (non-fatal): {e}")
 
     # ── 5. Create/ensure stream rows in DB ───────────────────────────────────
     work_dir = Path(config.tmp_dir) / Path(task["plex_stem"]).name
-    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _safe_mkdir(work_dir, "creating work dir")
+    except TaskFSError as e:
+        log("ERROR", str(e))
+        await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+        return
 
     duration_sec = ep_info.get("duration") or ep_info.get("duration_sec")
+
+    # Duration-based refinement of the free-space floor — best-effort advisory.
+    # Skipped when duration is unknown. Uses the *already-validated* root, so
+    # we can assume the path exists and is writable.
+    refined_min_gb = estimate_min_free_gb(duration_sec, config.min_free_space_gb)
+    if refined_min_gb > config.min_free_space_gb:
+        try:
+            validate_task_output_dir(output_root, refined_min_gb)
+        except OutputDirError as e:
+            log("ERROR", f"Output directory is too small for this task: {e}")
+            await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+            return
 
     # Register streams in DB (INSERT OR IGNORE preserves existing done/downloading ones)
     stream_ids: dict[str, int] = {}
@@ -189,7 +262,7 @@ async def download_task(task: dict, state) -> None:
         lang = st.get("language", "und")
         label = st.get("name", lang)
         # Sub sidecars go directly to output dir
-        out_stem = Path(config.output_dir) / task["plex_stem"]
+        out_stem = output_root / task["plex_stem"]
         lang_idx = i + 1
         out_path = str(out_stem.parent / f"{out_stem.name}.{lang}.srt") if lang_idx == 1 \
                    else str(out_stem.parent / f"{out_stem.name}.{lang}.{lang_idx}.srt")
@@ -375,10 +448,23 @@ async def download_task(task: dict, state) -> None:
 
     # ── 9. Merge ──────────────────────────────────────────────────────────────
     log("INFO", f"Merging {1 + len(downloaded_audio)} streams into MKV...")
-    mkv_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _safe_mkdir(mkv_path.parent, "creating output directory")
+    except TaskFSError as e:
+        log("ERROR", str(e))
+        await db_run(state, db_set_task_status, conn, task_id, "failed", error=str(e))
+        return
 
     try:
         ok = await merge_into_mkv(video_path, downloaded_audio, mkv_path)
+    except OSError as e:
+        err = TaskFSError("writing merged MKV to", mkv_path, e)
+        log("ERROR", f"Merge failed: {err}")
+        attempts = await db_run(state, db_increment_attempts, conn, task_id)
+        await db_run(state, db_set_task_status, conn, task_id,
+                     "failed" if attempts >= MAX_ATTEMPTS else "pending",
+                     error=str(err))
+        return
     except Exception as e:
         log("ERROR", f"Merge failed: {e}")
         attempts = await db_run(state, db_increment_attempts, conn, task_id)
@@ -539,12 +625,16 @@ async def add_sub_to_task(
     same_lang = [s for s in existing if s["stream_type"] == "subtitle" and s["lang"] == guessed_lang]
     idx = len(same_lang) + 1
 
-    out_stem = Path(config.output_dir) / task["plex_stem"]
+    output_root = task_output_root(task, config)
+    out_stem = output_root / task["plex_stem"]
     out_path = out_stem.parent / (
         f"{out_stem.name}.{guessed_lang}.srt" if idx == 1
         else f"{out_stem.name}.{guessed_lang}.{idx}.srt"
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _safe_mkdir(out_path.parent, "creating sidecar directory")
+    except TaskFSError as e:
+        raise RuntimeError(str(e)) from e
 
     sid = await db_run(state, db_upsert_stream, conn,
         task_id=task_id, stream_type="subtitle",

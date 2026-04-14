@@ -17,6 +17,7 @@ def test_defaults():
     assert cfg.video_quality == "lowest"
     assert "RUS" in cfg.audio_langs
     assert "rus" in cfg.sub_langs
+    assert cfg.min_free_space_gb == 10
 
 
 def test_load_from_file(tmp_path: Path):
@@ -156,3 +157,10 @@ def test_validate_bad_port_range(tmp_path: Path):
     cfg.http_port = 0
     errors, _ = cfg.validate()
     assert any("http_port" in e for e in errors)
+
+
+def test_validate_bad_min_free_space_gb(tmp_path: Path):
+    cfg = _good_cfg(tmp_path)
+    cfg.min_free_space_gb = -1
+    errors, _ = cfg.validate()
+    assert any("min_free_space_gb" in e for e in errors)
