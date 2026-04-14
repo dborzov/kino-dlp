@@ -67,6 +67,10 @@ scrap-pub sql "SELECT id, status FROM tasks ORDER BY id DESC LIMIT 10"
 scrap-pub paths               # prints output/tmp/db/cookies/config/website
 scrap-pub paths output        # just the output dir — for `cd $(scrap-pub paths output)`
 
+# Inspect an item page BEFORE enqueueing (no daemon required)
+scrap-pub lookup "https://example.com/item/view/121936/s0e1"             # title/year/kind
+scrap-pub lookup "https://example.com/item/view/30658/s10e4" --episodes  # + full episode list
+
 # Install a new package
 uv add <package>          # adds to pyproject.toml + syncs
 uv add --dev <package>    # dev dependency

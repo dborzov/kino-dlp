@@ -82,12 +82,19 @@ an absolute path, so you don't need to join it with `paths output` yourself.
 
 ## Daemon Control (CLI)
 
-All CLI commands are short-lived WebSocket connections to the daemon. The daemon must be
-running before any CLI command will work.
+Most CLI commands are short-lived WebSocket connections to the daemon; the
+daemon must be running for those. Two commands are purely local and work
+without the daemon: `scrap-pub paths` (prints resolved config paths) and
+`scrap-pub lookup` (fetches + parses one item page — see the [Lookup
+section](#lookup-pre-enqueue-reconnaissance) below).
 
 ```bash
 # Check daemon health
 scrap-pub status
+
+# Inspect an item page BEFORE enqueueing — prints kind/title/year and
+# tells you which Plex library it should go into. No daemon needed.
+scrap-pub lookup "https://example.com/item/view/121639/s0e1"
 
 # Enqueue a movie or specific episode (URLs match the site configured via `website`)
 scrap-pub enqueue "https://example.com/item/view/121639/s0e1"
@@ -179,6 +186,73 @@ this — replace `{website}` with whatever you set in config:
 | `{website}/item/view/ITEM_ID/s0e1` | Movie (season=0, episode=1) |
 
 The item ID is the numeric ID in the URL path.
+
+**Important caveat:** *you cannot tell from the URL alone whether `ITEM_ID`
+is a movie or a TV show.* The site uses `/s0e1` for movies and `/sXeY` for
+episodes, but a bare `/item/view/ITEM_ID` could be either — and a URL that
+*looks* like a movie (`/s0e1`) can occasionally be something surprising.
+**Always run `scrap-pub lookup URL` first** (next section) before choosing
+a Plex library path.
+
+---
+
+## Lookup (pre-enqueue reconnaissance)
+
+`scrap-pub lookup URL` fetches the page on the target site and prints the
+core metadata about the item — **Russian title, original-language title,
+year, and whether it is a movie or a TV show** — without enqueueing
+anything, without starting a download, and **without requiring the daemon
+to be running**. The only prerequisite is a valid `cookies.txt` at
+`~/.config/scrap-pub/cookies.txt` (same as every other scraping command).
+
+**Agents: run this first.** When you are given an unknown URL and asked to
+download it, you likely do not know whether the target is a movie or a TV
+show, and therefore cannot decide which Plex library directory (`Movies`
+vs `TV Shows`) to pass to `--output-dir` on `enqueue`. `lookup` exists to
+answer that one question before you commit. The output includes an
+explicit "Hint for agents:" line with the right enqueue command pre-formed
+for the detected kind — prefer reading that hint over constructing the
+command yourself.
+
+```bash
+# Movie — prints Type: movie, Year, Duration, and a Movies enqueue hint
+scrap-pub lookup "https://example.com/item/view/121936/s0e1"
+
+# TV show — prints Type: series, Year, Seasons list, the current S/E from
+# the URL (if any), and a TV Shows enqueue hint
+scrap-pub lookup "https://example.com/item/view/30658/s10e4"
+
+# Full episode breakdown: walk every season and list each episode URL.
+# For a 13-season show this takes ~20 s and prints a progress bar on
+# stderr while it works. Use this when you need the complete set of
+# per-episode URLs (e.g. to enqueue a single specific episode).
+scrap-pub lookup "https://example.com/item/view/30658/s10e4" --episodes
+
+# Machine-readable output — suitable for piping into jq or another agent
+scrap-pub lookup "https://example.com/item/view/121936/s0e1" --json
+```
+
+Typical non-JSON output for a TV show:
+
+```
+================================================================
+  When Calls the Heart
+  Когда зовёт сердце
+================================================================
+  Type         series
+  Year         2014
+  Seasons      13 available: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
+  Current      S10E04
+  URL          https://example.com/item/view/30658
+
+  Hint for agents: this is a TV show → enqueue with
+    scrap-pub enqueue "https://example.com/item/view/30658" --output-dir "/path/to/TV Shows"
+```
+
+See [Downloading into a Plex library](#downloading-into-a-plex-library)
+below for the enqueue side of the workflow — `lookup` is designed so you
+can read its hint line and then run exactly that command (swapping in
+your real Plex library path).
 
 ---
 

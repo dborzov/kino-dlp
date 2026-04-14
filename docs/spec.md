@@ -137,11 +137,13 @@ Parsed via Python's `http.cookiejar.MozillaCookieJar`.
 
 ## CLI reference
 
-All subcommands connect to a running daemon via WebSocket, send one command, print the reply, and exit. If the daemon isn't running you get:
+Most subcommands connect to a running daemon via WebSocket, send one command, print the reply, and exit. If the daemon isn't running you get:
 
 ```
 error: cannot connect to ws://localhost:8766 — is scrap-pub-server running?
 ```
+
+Two subcommands are purely local and work without the daemon: `scrap-pub paths` (echoes resolved config paths) and `scrap-pub lookup` (fetches + parses one target-site item page).
 
 ```
 scrap-pub status
@@ -168,6 +170,40 @@ scrap-pub enqueue URL [URL ...] [-o PATH | --output-dir PATH]
         the command fails with a "delete existing task first" error — it
         does **not** silently ignore the flag. Missing directories are
         auto-created *only* when the parent exists and is writable.
+
+scrap-pub lookup URL [-e|--episodes] [--json]
+    Fetch ONE item URL on the configured target site and print its core
+    metadata — Russian title, original-language title, year, and whether
+    the item is a movie or a TV show — without enqueueing anything.
+    Intended as a pre-enqueue reconnaissance step, especially for AI
+    agents that need to decide which Plex library (`Movies` vs
+    `TV Shows`) to pass to `enqueue --output-dir`. The human-readable
+    output includes an explicit "Hint for agents:" line with a ready-to-
+    run enqueue command tailored to the detected kind.
+
+    URL may be either the series root (`/item/view/ID`) or a specific
+    episode (`/item/view/ID/sXeY`). When the URL encodes a season and
+    episode, the output includes a "Current S10E04"-style line so you
+    can confirm the reference matches what you expected.
+
+    -e, --episodes
+        For TV shows, also walk every season and list every episode with
+        its per-episode URL. This fires one HTTP request per season with
+        a 0.8–2.0 s jitter between requests, so a 13-season show takes
+        ~15–25 s. A progress bar is drawn on stderr while seasons are
+        being fetched; the structured output still goes to stdout so
+        `--json | jq` keeps working.
+
+    --json
+        Emit the parsed metadata dict as JSON (title_ru, title_orig,
+        kind, year, seasons, seasons_data when --episodes was passed,
+        cast, genres, rating/id fields).
+
+    `lookup` is LOCAL — it does not talk to the daemon. The only
+    prerequisite is a valid cookies file at
+    `~/.config/scrap-pub/cookies.txt`; on cookie expiry it exits with a
+    clean "cookies expired or missing" error. It will refuse to run if
+    the `website` config key is unset.
 
 scrap-pub list [--status STATUS] [--kind K] [--since SPEC] [--until SPEC]
               [--completed-since SPEC] [--limit N] [--offset N] [-v] [--json]

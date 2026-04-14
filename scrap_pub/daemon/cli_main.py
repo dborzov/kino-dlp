@@ -23,6 +23,7 @@ Usage:
     scrap-pub add-sub   TASK_ID URL [--lang LANG]
     scrap-pub config [--set KEY=VALUE]
     scrap-pub paths [KEY]           # echo resolved paths from config (no daemon needed)
+    scrap-pub lookup URL [--episodes] [--json]   # fetch + parse one item page (no daemon)
 """
 
 import argparse
@@ -553,6 +554,130 @@ def cmd_paths(args, config) -> None:
         print(f"{key.ljust(width)}  {getattr(config, attr)}")
 
 
+# ── lookup (local, no daemon) ────────────────────────────────────────────────
+
+
+def _print_lookup(info: dict) -> None:
+    """Human-readable metadata dump for `scrap-pub lookup`."""
+    title_orig = info.get("title_orig")
+    title_ru = info.get("title_ru")
+    headline = title_orig or title_ru or "Unknown title"
+    bar = "=" * 64
+    print(bar)
+    print(f"  {headline}")
+    if title_ru and title_ru != headline:
+        print(f"  {title_ru}")
+    print(bar)
+
+    def row(label: str, value) -> None:
+        if value not in (None, "", [], {}):
+            print(f"  {label:<12} {value}")
+
+    kind = info.get("kind")
+    row("Type", kind)
+    row("Year", info.get("year"))
+    row("Duration", info.get("duration_str"))
+    row("Age rating", info.get("age_rating"))
+
+    countries = info.get("countries")
+    if countries:
+        row("Countries", ", ".join(countries))
+    genres = info.get("genres")
+    if genres:
+        row("Genres", ", ".join(genres))
+
+    if kind == "series":
+        seasons = info.get("seasons", [])
+        if seasons:
+            row("Seasons", f"{len(seasons)} available: {', '.join(str(s) for s in seasons)}")
+        ins = info.get("input_season")
+        ine = info.get("input_episode")
+        if ins is not None and ine is not None:
+            row("Current", f"S{ins:02d}E{ine:02d}")
+
+    row("URL", info.get("url"))
+
+    # Agent hint — the whole point of this command.
+    url = info.get("url") or "<URL>"
+    if kind == "movie":
+        print()
+        print("  Hint for agents: this is a movie → enqueue with")
+        print(f'    scrap-pub enqueue "{url}" --output-dir "/path/to/Movies"')
+    elif kind == "series":
+        print()
+        print("  Hint for agents: this is a TV show → enqueue with")
+        print(f'    scrap-pub enqueue "{url}" --output-dir "/path/to/TV Shows"')
+
+    # Full episode breakdown (only when --episodes was passed and populated).
+    sd = info.get("seasons_data")
+    if sd:
+        from . import scraper
+        item_id = info.get("id", "")
+        print()
+        print("  Episodes:")
+        for s in sorted(sd.keys()):
+            episodes = sd[s].get("episodes", [])
+            print(f"    Season {int(s):02d} ({len(episodes)} episodes)")
+            for ep in episodes:
+                sn = int(ep.get("season", 0))
+                en = int(ep.get("episode", 0))
+                title = ep.get("title") or ""
+                title_col = title[:38].ljust(38)
+                ep_url = scraper.episode_url(item_id, sn, en)
+                print(f"      S{sn:02d}E{en:02d}  {title_col}  {ep_url}")
+
+
+def cmd_lookup(args, config) -> None:
+    from . import scraper, session
+
+    if not config.website:
+        _die(
+            "no target website configured. "
+            "Set it with: scrap-pub config --set website=https://example.com"
+        )
+
+    scraper.set_website(config.website)
+    session.init_session(config.cookies_path)
+
+    bar_state = {"shown": False}
+
+    def _progress(done: int, total: int, current_season: int) -> None:
+        if total <= 0:
+            return
+        pct = 100.0 * done / total
+        bar = _fmt_progress_bar(pct)
+        sys.stderr.write(
+            f"\r  Fetching season {current_season:>2d}  ({done}/{total}) {bar} {int(pct):3d}%"
+        )
+        sys.stderr.flush()
+        bar_state["shown"] = True
+
+    try:
+        info = scraper.scrape(
+            args.url,
+            fetch_episodes=bool(args.episodes),
+            progress_cb=_progress if args.episodes else None,
+        )
+    except scraper.CookieExpiredError as e:
+        if bar_state["shown"]:
+            sys.stderr.write("\r" + " " * 78 + "\r")
+        _die(f"cookies expired or missing: {e}")
+    except Exception as e:
+        if bar_state["shown"]:
+            sys.stderr.write("\r" + " " * 78 + "\r")
+        _die(f"lookup failed: {e}")
+
+    if bar_state["shown"]:
+        sys.stderr.write("\r" + " " * 78 + "\r")
+        sys.stderr.flush()
+
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
+        return
+
+    _print_lookup(info)
+
+
 async def cmd_config(args, config) -> None:
     if args.set:
         # Parse KEY=VALUE pairs
@@ -713,6 +838,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="One of: " + ", ".join(_PATH_KEYS) + ". Omit to list all.",
     )
 
+    # lookup (local, no daemon required)
+    p = sub.add_parser(
+        "lookup",
+        help=(
+            "Fetch a target-site item page and print core metadata "
+            "(title, year, movie-vs-series) without enqueueing anything."
+        ),
+        description=(
+            "Pre-enqueue reconnaissance: fetch ONE URL on the configured "
+            "target site, print its original-language and Russian titles, "
+            "year, and whether it is a movie or a TV show. For TV shows "
+            "with --episodes, walk every season and list all episode URLs "
+            "(progress bar shown on stderr). Runs client-side — the daemon "
+            "does NOT need to be running, only valid cookies in "
+            "~/.config/scrap-pub/cookies.txt."
+        ),
+    )
+    p.add_argument("url", help="Item URL on the configured target site.")
+    p.add_argument(
+        "-e", "--episodes",
+        action="store_true",
+        help="For TV shows, also fetch every season and list every "
+             "episode with its per-episode URL.",
+    )
+    p.add_argument("--json", action="store_true",
+                   help="Emit the parsed metadata dict as JSON.")
+
     return parser
 
 
@@ -732,6 +884,7 @@ _HANDLERS = {
     "add-sub":   cmd_add_sub,
     "config":    cmd_config,
     "paths":     cmd_paths,
+    "lookup":    cmd_lookup,
 }
 
 

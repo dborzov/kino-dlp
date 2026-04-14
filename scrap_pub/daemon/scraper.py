@@ -23,6 +23,7 @@ import random
 import re
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -114,9 +115,11 @@ def _parse_og_titles(soup: BeautifulSoup) -> tuple[str | None, str | None]:
     if not og or not og.get("content"):
         return None, None
     content = og["content"].strip()
-    if " / " in content:
-        parts = content.split(" / ", 1)
-        return parts[0].strip() or None, parts[1].strip() or None
+    # The site is inconsistent with whitespace around the RU/orig separator:
+    # sometimes " / ", sometimes " /", sometimes "/ ". Accept any of them.
+    m = re.split(r'\s*/\s*', content, maxsplit=1)
+    if len(m) == 2 and m[0].strip() and m[1].strip():
+        return m[0].strip(), m[1].strip()
     return content or None, None
 
 
@@ -210,12 +213,39 @@ def _parse_playlist(html: str, season: int | None = None) -> list[dict]:
 
 # ── Full scrape ────────────────────────────────────────────────────────────────
 
-def scrape(arg: str) -> dict:
-    """Scrape full metadata for a movie or TV series. Returns metadata dict."""
+def scrape(
+    arg: str,
+    *,
+    fetch_episodes: bool = True,
+    progress_cb: Callable[[int, int, int], None] | None = None,
+) -> dict:
+    """
+    Scrape metadata for a movie or TV series. Returns metadata dict.
+
+    fetch_episodes=True (default) walks every season of a series and populates
+    result["seasons_data"][s] = {episodes, audio_tracks, subtitles}. This is
+    what downloader.download_task() and scaffold() need.
+
+    fetch_episodes=False is a fast path used by `scrap-pub lookup`: one HTTP
+    request, parses titles/year/kind, and for a series populates just
+    result["seasons"] (list of season numbers from the selector buttons).
+    No per-season fetches, no seasons_data, no PLAYER_PLAYLIST walk.
+
+    progress_cb(done, total, current_season) is invoked before each season
+    fetch when fetch_episodes=True and the target is a series. The callback
+    renders whatever UI it likes; the scraper stays I/O-agnostic.
+    """
     url, item_id = normalise_url(arg)
 
+    # Capture input-URL season/episode for callers that want to display it
+    # (e.g. `lookup` showing "current URL points at S10E04"). Only surfaced
+    # in the returned dict when the URL actually encoded them.
+    m_se = re.search(r'/s(\d+)e(\d+)$', url)
+    input_season = int(m_se.group(1)) if m_se else None
+    input_episode = int(m_se.group(2)) if m_se else None
+
     # Normalise to root URL for metadata (strip sNNeNN suffix)
-    is_episode_url = bool(re.search(r'/s\d+e\d+$', url))
+    is_episode_url = m_se is not None
     root_url = f"{_base()}/item/view/{item_id}" if is_episode_url else url
 
     soup_root, html_root = _fetch(root_url)
@@ -237,6 +267,12 @@ def scrape(arg: str) -> dict:
         "poster_url": poster_url,
         **meta,
     }
+    # Movie URLs are served as /s0e1, which is a site convention rather
+    # than a meaningful season/episode. Only surface input_season/episode
+    # when they look like a real series reference.
+    if input_season is not None and (seasons or input_season > 0):
+        result["input_season"] = input_season
+        result["input_episode"] = input_episode
 
     if not seasons:
         # Movie — parse PLAYER_PLAYLIST from root page (or the episode URL)
@@ -255,20 +291,31 @@ def scrape(arg: str) -> dict:
                 "duration_sec": ep.get("duration_sec"),
             }
         result["audio_tracks"] = _parse_audio(row)
-    else:
-        result["kind"] = "series"
-        result["seasons_data"] = {}
+        return result
 
-        for i, s in enumerate(seasons):
-            s_url = _season_url(item_id, s)
-            time.sleep(random.uniform(0.8, 2.0))
-            s_soup, s_html = _fetch(s_url, referer=root_url)
-            s_row = _main_row(s_soup)
-            result["seasons_data"][s] = {
-                "episodes":     _parse_playlist(s_html, s),
-                "audio_tracks": _parse_audio(s_row) if s_row else [],
-                "subtitles":    _parse_meta_table(s_row).get("subtitles", []) if s_row else [],
-            }
+    result["kind"] = "series"
+    result["seasons"] = seasons
+
+    if not fetch_episodes:
+        # Fast path: caller only wants kind/title/year + season list.
+        return result
+
+    result["seasons_data"] = {}
+    total = len(seasons)
+    for i, s in enumerate(seasons):
+        if progress_cb is not None:
+            progress_cb(i, total, s)
+        s_url = _season_url(item_id, s)
+        time.sleep(random.uniform(0.8, 2.0))
+        s_soup, s_html = _fetch(s_url, referer=root_url)
+        s_row = _main_row(s_soup)
+        result["seasons_data"][s] = {
+            "episodes":     _parse_playlist(s_html, s),
+            "audio_tracks": _parse_audio(s_row) if s_row else [],
+            "subtitles":    _parse_meta_table(s_row).get("subtitles", []) if s_row else [],
+        }
+    if progress_cb is not None:
+        progress_cb(total, total, seasons[-1])
 
     return result
 

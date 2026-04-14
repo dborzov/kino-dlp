@@ -124,11 +124,16 @@ open the **web UI** at `http://localhost:8765` → Settings and paste your
 
 ## Usage — CLI
 
-All CLI commands connect to the running daemon via WebSocket.
+Most CLI commands connect to the running daemon via WebSocket. A few (`paths`, `lookup`) run entirely client-side and work without the daemon.
 
 ```bash
 # Status
 scrap-pub status
+
+# Inspect a URL BEFORE enqueueing — title, year, movie-vs-TV-show.
+# Runs locally (no daemon); reads cookies from ~/.config/scrap-pub/cookies.txt.
+scrap-pub lookup "https://example.com/item/view/121639/s0e1"
+scrap-pub lookup "https://example.com/item/view/122266/s1e1" --episodes  # full breakdown
 
 # Enqueue downloads (URLs on the target site you configured via `website`)
 scrap-pub enqueue "https://example.com/item/view/121639/s0e1"   # movie
