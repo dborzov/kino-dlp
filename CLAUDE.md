@@ -4,6 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Working rules
 
+- **This is a public open-source project on GitHub.** Anything committed to
+  the git object store — including commits that are later "removed" or
+  rewritten — is world-readable the moment it's pushed, and GitHub caches
+  force-pushed blobs for a long time. Before staging or committing, scan the
+  diff and any new/untracked files for things that must not leak: real
+  target-site hostnames or URLs, cookies / session tokens / API keys, user
+  paths that reveal personal info, local config values, captured HTML or
+  HAR files under `raw/`, and anything under `output/` or `tmp/`. If you
+  see anything that *might* be sensitive, stop and double-check with the
+  user before `git add` / `git commit`.
 - **Never overwrite `~/.config/scrap-pub/config.json`.** It holds the user's
   real, hand-tuned values (`website`, paths, language lists, concurrency, etc.).
   When a task requires changing a config value, use `scrap-pub config --set
