@@ -26,6 +26,7 @@ from .ws_protocol import (
     CMD_GET,
     CMD_LIST,
     CMD_LOGS,
+    CMD_OUTPUT_DIR_HISTORY,
     CMD_PAUSE,
     CMD_RESUME,
     CMD_RETRY,
@@ -337,6 +338,9 @@ async def dispatch(msg: dict, state) -> dict:
 
         try:
             task_ids = await _enqueue_url(url, state, output_dir=resolved_output_dir)
+            if resolved_output_dir:
+                from .db import db_record_output_dir_usage
+                await db_run(state, db_record_output_dir_usage, state.conn, resolved_output_dir)
             return reply_ok(cmd, enqueued=len(task_ids), task_ids=task_ids,
                             output_dir=resolved_output_dir)
         except Exception as e:
@@ -440,6 +444,12 @@ async def dispatch(msg: dict, state) -> dict:
         from .downloader import add_sub_to_task
         stream_id = await add_sub_to_task(int(task_id), url, lang, state)
         return reply_ok(cmd, stream_id=stream_id)
+
+    # ── output_dir_history ────────────────────────────────────────────────────
+    elif cmd == CMD_OUTPUT_DIR_HISTORY:
+        from .db import db_get_output_dir_history
+        paths = await db_run(state, db_get_output_dir_history, state.conn)
+        return reply_ok(cmd, paths=paths)
 
     else:
         return reply_err(cmd or "?", f"unknown command: {cmd!r}")

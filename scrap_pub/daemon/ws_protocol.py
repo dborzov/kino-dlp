@@ -62,8 +62,9 @@ CMD_RESUME     = "resume"
 CMD_COOKIES    = "cookies"
 CMD_ADD_AUDIO  = "add_audio"
 CMD_ADD_SUB    = "add_sub"
-CMD_CONFIG_GET = "config_get"
-CMD_CONFIG_SET = "config_set"
+CMD_CONFIG_GET          = "config_get"
+CMD_CONFIG_SET          = "config_set"
+CMD_OUTPUT_DIR_HISTORY  = "output_dir_history"
 
 
 # ── Encode / decode ────────────────────────────────────────────────────────────

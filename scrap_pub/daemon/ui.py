@@ -243,7 +243,9 @@ progress.done::-webkit-progress-value { background: var(--green); }
 <div id="tab-queue" class="tab-content active">
   <div class="enqueue-form">
     <input id="enqueue-url" type="text" placeholder="https://your-site.example/item/view/..." />
-    <input id="enqueue-output-dir" type="text" placeholder="/mnt/plex/TV Shows (optional — leave empty for default)" />
+    <input id="enqueue-output-dir" type="text" list="output-dir-suggestions"
+           placeholder="/mnt/plex/TV Shows (optional — leave empty for default)" />
+    <datalist id="output-dir-suggestions"></datalist>
     <button class="btn-primary" onclick="doEnqueue()">+ Add</button>
   </div>
   <div class="section-title" id="pending-title">Pending (0)</div>
@@ -454,6 +456,7 @@ function connect() {
     clearTimeout(wsReconnectTimer);
     if (state.reconnectToast) { state.reconnectToast.remove(); state.reconnectToast = null; }
     loadTasks();
+    sendCmd({cmd: 'output_dir_history'});
   };
 
   ws.onclose = () => {
@@ -571,9 +574,21 @@ function handleReply(msg) {
     renderDoneList();
   }
   if (msg.cmd === 'enqueue') {
-    id('enqueue-url').value = '';
-    showToast(`Enqueued ${msg.enqueued || 0} task(s)`, 'info');
-    loadTasks();
+    const n = msg.enqueued || 0;
+    if (n === 0) {
+      showToast('Already in queue — no new tasks added', 'warn');
+    } else {
+      id('enqueue-url').value = '';
+      showToast(`Enqueued ${n} task(s)`, 'info');
+      loadTasks();
+    }
+    if (msg.output_dir) sendCmd({cmd: 'output_dir_history'});
+  }
+  if (msg.cmd === 'output_dir_history' && Array.isArray(msg.paths)) {
+    const dl = id('output-dir-suggestions');
+    dl.innerHTML = msg.paths
+      .map(p => `<option value="${escHtml(p)}"></option>`)
+      .join('');
   }
 }
 

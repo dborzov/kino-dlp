@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS logs (
 CREATE INDEX IF NOT EXISTS idx_logs_task ON logs(task_id);
 CREATE INDEX IF NOT EXISTS idx_logs_ts   ON logs(ts);
 
+CREATE TABLE IF NOT EXISTS output_dir_history (
+    path         TEXT PRIMARY KEY,
+    last_used_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -122,6 +127,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
     if "output_dir" not in existing:
         conn.execute("ALTER TABLE tasks ADD COLUMN output_dir TEXT")
+        conn.commit()
+
+    # One-time migration: seed output_dir_history from existing task rows.
+    # Guarded by a kv flag so it only runs once even on repeated opens.
+    migrated = conn.execute(
+        "SELECT value FROM kv WHERE key='output_dir_history_migrated'"
+    ).fetchone()
+    if not migrated:
+        conn.execute("""
+            INSERT OR IGNORE INTO output_dir_history (path, last_used_at)
+            SELECT output_dir, MAX(enqueued_at)
+            FROM tasks
+            WHERE output_dir IS NOT NULL AND output_dir != ''
+            GROUP BY output_dir
+        """)
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES ('output_dir_history_migrated', 'true')"
+        )
         conn.commit()
 
 
@@ -480,6 +503,26 @@ def db_is_cookie_error(conn: sqlite3.Connection) -> bool:
 
 def db_set_cookie_error(conn: sqlite3.Connection, error: bool) -> None:
     db_kv_set(conn, "cookie_error", "true" if error else "false")
+
+
+# ── Output-dir history ────────────────────────────────────────────────────────
+
+def db_record_output_dir_usage(conn: sqlite3.Connection, path: str) -> None:
+    """Upsert a path into output_dir_history, updating its last_used_at timestamp."""
+    conn.execute("""
+        INSERT INTO output_dir_history (path, last_used_at)
+        VALUES (?, ?)
+        ON CONFLICT(path) DO UPDATE SET last_used_at = excluded.last_used_at
+    """, (path, _now()))
+    conn.commit()
+
+
+def db_get_output_dir_history(conn: sqlite3.Connection) -> list[str]:
+    """Return previously used output paths, most recently used first."""
+    rows = conn.execute(
+        "SELECT path FROM output_dir_history ORDER BY last_used_at DESC"
+    ).fetchall()
+    return [r["path"] for r in rows]
 
 
 # ── Queue status summary ───────────────────────────────────────────────────────

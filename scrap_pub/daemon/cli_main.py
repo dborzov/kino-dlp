@@ -233,11 +233,15 @@ async def cmd_enqueue(args, config) -> None:
             payload["output_dir"] = output_dir
         reply = await _send_recv(_ws_url(config), payload)
         if reply.get("ok"):
+            n = reply.get("enqueued", 0)
             ids = reply.get("task_ids", [])
             suffix = f"  → {output_dir}" if output_dir else ""
-            print(f"Enqueued {reply.get('enqueued')} task(s): {ids}  ← {url}{suffix}")
+            if n == 0:
+                print(f"Already in queue — no new tasks added: {url}{suffix}")
+            else:
+                print(f"Enqueued {n} task(s): {ids}  ← {url}{suffix}")
         else:
-            print(f"Error for {url}: {reply.get('error')}", file=sys.stderr)
+            print(f"Error: {reply.get('error')}", file=sys.stderr)
 
 
 async def cmd_list(args, config) -> None:

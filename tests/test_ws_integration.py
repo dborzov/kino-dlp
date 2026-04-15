@@ -589,3 +589,116 @@ async def test_sql_rejects_empty_query(ws_server):
     state, url = ws_server
     reply = await _cmd(url, {"cmd": "sql", "query": "   "})
     assert reply["ok"] is False
+
+
+# ── CMD_OUTPUT_DIR_HISTORY ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_output_dir_history_empty(ws_server):
+    """With no history recorded the command returns an empty list."""
+    state, url = ws_server
+    reply = await _cmd(url, {"cmd": "output_dir_history"})
+    assert reply["ok"] is True
+    assert reply["paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_output_dir_history_returns_recorded_paths(ws_server):
+    """Paths written directly to the DB are returned by the command."""
+    from scrap_pub.daemon.db import db_record_output_dir_usage
+
+    state, url = ws_server
+    db_record_output_dir_usage(state.conn, "/mnt/plex/Movies")
+    db_record_output_dir_usage(state.conn, "/mnt/plex/TV Shows")
+    reply = await _cmd(url, {"cmd": "output_dir_history"})
+    assert reply["ok"] is True
+    assert "/mnt/plex/Movies" in reply["paths"]
+    assert "/mnt/plex/TV Shows" in reply["paths"]
+
+
+@pytest.mark.asyncio
+async def test_output_dir_history_most_recent_first(ws_server):
+    """The command returns paths most-recently-used first."""
+    import time
+
+    from scrap_pub.daemon.db import db_record_output_dir_usage
+
+    state, url = ws_server
+    db_record_output_dir_usage(state.conn, "/mnt/older")
+    time.sleep(0.01)
+    db_record_output_dir_usage(state.conn, "/mnt/newer")
+    reply = await _cmd(url, {"cmd": "output_dir_history"})
+    assert reply["ok"] is True
+    assert reply["paths"][0] == "/mnt/newer"
+    assert reply["paths"][1] == "/mnt/older"
+
+
+# ── CMD_ENQUEUE — duplicate / already-queued scenarios ───────────────────────
+#
+# The full _enqueue_url path requires live network access (scrape + scaffold).
+# These tests exercise the dispatch layer by monkeypatching _enqueue_url so we
+# can verify the server packages the response correctly for each outcome.
+
+
+@pytest.mark.asyncio
+async def test_enqueue_already_queued_returns_zero(ws_server, monkeypatch):
+    """When all tasks already exist, enqueued=0 with ok=True."""
+    state, url = ws_server
+
+    async def _fake_enqueue(item_url, st, *, output_dir=None):
+        return []  # every task was already in the DB
+
+    monkeypatch.setattr("scrap_pub.daemon.ws_server._enqueue_url", _fake_enqueue)
+
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/999/s0e1",
+    })
+    assert reply["ok"] is True
+    assert reply["enqueued"] == 0
+    assert reply["task_ids"] == []
+
+
+@pytest.mark.asyncio
+async def test_enqueue_already_queued_with_new_output_dir_errors(ws_server, monkeypatch, tmp_path):
+    """Re-enqueueing the same item with a *different* output_dir raises a clear error."""
+    state, url = ws_server
+
+    async def _fake_enqueue(item_url, st, *, output_dir=None):
+        raise ValueError(
+            "task 7 already exists for this item with a different "
+            "output_dir (/mnt/old). Delete it first, then re-enqueue."
+        )
+
+    monkeypatch.setattr("scrap_pub.daemon.ws_server._enqueue_url", _fake_enqueue)
+
+    # output_dir must pass local validation, so use a real writable dir
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/999/s0e1",
+        "output_dir": str(tmp_path),
+    })
+    assert reply["ok"] is False
+    assert "already exists" in reply["error"]
+    assert "output_dir" in reply["error"]
+    assert "Delete it first" in reply["error"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_partial_new_tasks_reported_correctly(ws_server, monkeypatch):
+    """If some episodes are new and some already exist, only new IDs are reported."""
+    state, url = ws_server
+
+    async def _fake_enqueue(item_url, st, *, output_dir=None):
+        return [101, 102]  # two new episodes out of, say, ten
+
+    monkeypatch.setattr("scrap_pub.daemon.ws_server._enqueue_url", _fake_enqueue)
+
+    reply = await _cmd(url, {
+        "cmd": "enqueue",
+        "url": "https://example.com/item/view/888",
+    })
+    assert reply["ok"] is True
+    assert reply["enqueued"] == 2
+    assert reply["task_ids"] == [101, 102]

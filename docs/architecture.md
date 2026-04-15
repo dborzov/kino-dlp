@@ -170,6 +170,13 @@ CREATE TABLE logs (
 CREATE INDEX idx_logs_task ON logs(task_id);
 CREATE INDEX idx_logs_ts   ON logs(ts);
 
+-- MRU list of output_dir values entered by the user at enqueue time.
+-- Drives the "previously used paths" datalist in the web UI Queue tab.
+CREATE TABLE output_dir_history (
+    path         TEXT PRIMARY KEY,
+    last_used_at TEXT NOT NULL     -- UTC ISO-8601; updated on every use
+);
+
 -- Runtime state: pause flag, cookie_error flag
 CREATE TABLE kv (
     key   TEXT PRIMARY KEY,
@@ -186,11 +193,20 @@ the Web UI.
 ### Schema migrations
 
 `db.open_db()` runs `SCHEMA` (the `CREATE TABLE IF NOT EXISTS` block) plus a
-tiny `_migrate()` step that inspects `PRAGMA table_info(tasks)` and runs any
-missing `ALTER TABLE tasks ADD COLUMN …` statements. Today that's just
-`output_dir TEXT`, added for per-task output overrides; the migration is
-idempotent and safe under WAL. There is no migrations table and no
-versioning — new columns are always nullable and always added here.
+tiny `_migrate()` step. Migrations run on every open and must be idempotent:
+
+- **`output_dir` column** — `ALTER TABLE tasks ADD COLUMN output_dir TEXT` if
+  missing (per-task output override added after initial release).
+- **`output_dir_history` seeding** — on first open after the table was added,
+  distinct non-null `output_dir` values from existing `tasks` rows are copied
+  into `output_dir_history` so the web UI datalist is immediately populated from
+  historical data. Guarded by a `kv` flag (`output_dir_history_migrated`) so
+  the INSERT runs exactly once. The table itself is created by `SCHEMA` on any
+  open.
+
+There is no migrations table and no versioning — new columns are always
+nullable, always added via `ALTER TABLE`, and the guard flag pattern is used for
+one-time data backfills.
 
 ### Why stream-level tracking
 

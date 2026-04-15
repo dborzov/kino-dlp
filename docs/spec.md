@@ -179,6 +179,14 @@ scrap-pub enqueue URL [URL ...] [-o PATH | --output-dir PATH]
         does **not** silently ignore the flag. Missing directories are
         auto-created *only* when the parent exists and is writable.
 
+    Exit behaviour for duplicates:
+        Re-enqueueing a URL that is already in the queue with the same (or no)
+        `--output-dir` prints "Already in queue — no new tasks added: URL"
+        and exits 0. This is an intentional idempotent no-op, not an error.
+        The web UI shows a yellow "Already in queue" warning toast in the same
+        case. Enqueue with a *different* `--output-dir` prints an error to
+        stderr and exits non-zero.
+
 scrap-pub lookup URL [-e|--episodes] [-d|--description] [--json]
     Fetch ONE item URL on the configured target site and print its core
     metadata — Russian title, original-language title, year, and whether
@@ -308,7 +316,8 @@ Single port (default `8766`). All messages are JSON.
 | `get` | `task_id` | Single task with `streams`, live progress overlay, and `output_size_bytes`. Replies `ok: false` if not found. |
 | `sql` | `query`, `params?`, `write?`, `max_rows?` | Run a SQL query. Read-only by default (first-token gate: `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`); set `write: true` to allow DML/DDL. Reply includes `columns`, `rows`, `rowcount`, `truncated`. Row cap defaults to 1000. |
 | `logs` | `task_id?`, `limit?` | Log entries |
-| `enqueue` | `url`, `output_dir?` | Scrape + create tasks. Optional `output_dir` overrides the default `output_dir` config for every task created by this call. The server validates it (parent exists, writable, free space ≥ `min_free_space_gb`) before any scraping happens; on failure the reply is `{ok: false, error: "..."}` and no task rows or scaffold files are written. A re-enqueue of an already-queued item with a different `output_dir` also fails with a clear error. |
+| `enqueue` | `url`, `output_dir?` | Scrape + create tasks. Optional `output_dir` overrides the default `output_dir` config for every task created by this call. The server validates it (parent exists, writable, free space ≥ `min_free_space_gb`) before any scraping happens; on failure the reply is `{ok: false, error: "..."}` and no task rows or scaffold files are written. Re-enqueueing an already-queued item with the **same** (or no) `output_dir` is a silent no-op: `{ok: true, enqueued: 0, task_ids: []}`. Re-enqueueing with a **different** `output_dir` fails with a "delete existing task first" error. On success with a non-empty `output_dir` the path is recorded in `output_dir_history`. |
+| `output_dir_history` | — | Return the list of previously used `output_dir` values, most-recently-used first. The web UI Queue tab requests this on connect to populate the datalist for the output-dir input. |
 | `retry` | `task_id` | Reset task to pending (clears `completed_at`) |
 | `skip` | `task_id` | Mark task skipped |
 | `pause` | — | Pause workers |

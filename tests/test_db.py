@@ -7,6 +7,7 @@ import pytest
 from scrap_pub.daemon.db import (
     db_claim_next_task,
     db_get_logs,
+    db_get_output_dir_history,
     db_get_task,
     db_increment_attempts,
     db_insert_task,
@@ -15,6 +16,7 @@ from scrap_pub.daemon.db import (
     db_list_tasks,
     db_log,
     db_queue_summary,
+    db_record_output_dir_usage,
     db_set_cookie_error,
     db_set_paused,
     db_set_task_status,
@@ -446,3 +448,114 @@ def test_queue_summary_counts(conn):
     assert summary["pending"] == 1
     assert summary["done"]    == 1
     assert summary["failed"]  == 1
+
+
+# ── output_dir_history ────────────────────────────────────────────────────────
+
+
+def test_output_dir_history_empty_initially(conn):
+    assert db_get_output_dir_history(conn) == []
+
+
+def test_output_dir_history_record_and_retrieve(conn):
+    db_record_output_dir_usage(conn, "/mnt/plex/Movies")
+    db_record_output_dir_usage(conn, "/mnt/plex/TV Shows")
+    paths = db_get_output_dir_history(conn)
+    assert "/mnt/plex/Movies" in paths
+    assert "/mnt/plex/TV Shows" in paths
+
+
+def test_output_dir_history_most_recent_first(conn):
+    """The path used most recently must come first."""
+    import time
+    db_record_output_dir_usage(conn, "/mnt/first")
+    time.sleep(0.01)
+    db_record_output_dir_usage(conn, "/mnt/second")
+    paths = db_get_output_dir_history(conn)
+    assert paths[0] == "/mnt/second"
+    assert paths[1] == "/mnt/first"
+
+
+def test_output_dir_history_re_use_bubbles_to_top(conn):
+    """Re-using an older path updates its timestamp and moves it to the front."""
+    import time
+    db_record_output_dir_usage(conn, "/mnt/first")
+    time.sleep(0.01)
+    db_record_output_dir_usage(conn, "/mnt/second")
+    time.sleep(0.01)
+    # Re-use the older path — it should now be first
+    db_record_output_dir_usage(conn, "/mnt/first")
+    paths = db_get_output_dir_history(conn)
+    assert paths[0] == "/mnt/first"
+    assert paths[1] == "/mnt/second"
+
+
+def test_output_dir_history_no_duplicates(conn):
+    """Recording the same path twice yields only one entry."""
+    db_record_output_dir_usage(conn, "/mnt/plex")
+    db_record_output_dir_usage(conn, "/mnt/plex")
+    paths = db_get_output_dir_history(conn)
+    assert paths.count("/mnt/plex") == 1
+
+
+def test_output_dir_history_migration_seeds_from_tasks(tmp_path):
+    """One-time migration seeds history from pre-existing task output_dir values."""
+    import sqlite3
+
+    # Build a DB manually with tasks that have output_dir but no history table yet.
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE IF NOT EXISTS items (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+            title_orig TEXT NOT NULL, title_ru TEXT, year TEXT,
+            url TEXT NOT NULL, poster_url TEXT, meta_json TEXT, scraped_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL REFERENCES items(id),
+            kind TEXT NOT NULL,
+            season INTEGER NOT NULL DEFAULT 0,
+            episode INTEGER NOT NULL DEFAULT 0,
+            episode_title TEXT, media_id TEXT, plex_stem TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, enqueued_at TEXT NOT NULL,
+            started_at TEXT, completed_at TEXT, mkv_path TEXT,
+            output_dir TEXT,
+            UNIQUE(item_id, season, episode)
+        );
+        CREATE TABLE IF NOT EXISTS streams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            stream_type TEXT NOT NULL, label TEXT, lang TEXT,
+            forced INTEGER NOT NULL DEFAULT 0, source_url TEXT,
+            resolved_at TEXT, tmp_path TEXT, out_path TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            progress_pct REAL, size_bytes INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, started_at TEXT, completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+            ts TEXT NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO items VALUES ('i1','movie','Film A',NULL,'2024','http://x/1',NULL,'{}',NULL);
+        INSERT INTO items VALUES ('i2','movie','Film B',NULL,'2024','http://x/2',NULL,'{}',NULL);
+        INSERT INTO tasks (item_id,kind,season,episode,enqueued_at,output_dir)
+            VALUES ('i1','movie',0,1,'2024-01-01T00:00:00+00:00','/mnt/movies');
+        INSERT INTO tasks (item_id,kind,season,episode,enqueued_at,output_dir)
+            VALUES ('i2','movie',0,1,'2024-06-01T00:00:00+00:00','/mnt/movies');
+    """)
+    conn.close()
+
+    # open_db triggers _migrate which should seed output_dir_history
+    conn2 = open_db(db_path)
+    paths = db_get_output_dir_history(conn2)
+    conn2.close()
+    assert "/mnt/movies" in paths
