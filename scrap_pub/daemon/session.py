@@ -20,9 +20,12 @@ Lifecycle:
 """
 
 import http.cookiejar
+import logging
 from pathlib import Path
 
 from curl_cffi import requests as cffi_requests
+
+log = logging.getLogger(__name__)
 
 _HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -60,22 +63,24 @@ def init_session(cookies_path: Path) -> None:
     global _current_cookies, _session
     cookies_path = Path(cookies_path).expanduser()
     if not cookies_path.exists():
-        print(
-            f"[session] cookies file not found at {cookies_path} — "
-            "scraping will fail until you run `scrap-pub cookies <file>`."
+        log.warning(
+            "cookies file not found at %s — "
+            "scraping will fail until you run `scrap-pub cookies <file>`.",
+            cookies_path,
         )
         _current_cookies = {}
     else:
         try:
             _current_cookies = _parse_cookies_file(cookies_path)
         except Exception as e:
-            print(f"[session] could not parse {cookies_path}: {e}")
+            log.error("could not parse cookies file %s: %s", cookies_path, e)
             _current_cookies = {}
         missing = validate_cookies(_current_cookies)
         if missing:
-            print(
-                f"[session] {cookies_path} is missing required cookies: {missing}. "
-                "Upload a fresh cookies.txt via `scrap-pub cookies <file>`."
+            log.warning(
+                "%s is missing required cookies: %s — "
+                "upload a fresh cookies.txt via `scrap-pub cookies <file>`.",
+                cookies_path, missing,
             )
     _session = None  # rebuilt lazily in get_session()
 
@@ -128,6 +133,34 @@ def write_cookies_file(cookies_path: Path, raw_text: str) -> dict[str, str]:
 def validate_cookies(cookies: dict) -> list[str]:
     """Return sorted list of missing required cookie keys (empty = valid)."""
     return sorted(REQUIRED_COOKIE_KEYS - set(cookies.keys()))
+
+
+def check_cookies_file(path: Path) -> list[str]:
+    """Return human-readable error strings describing why the cookies file is unusable.
+
+    An empty list means the file exists, is parseable, and contains all
+    required cookies. Called by server_main at startup to fail fast with a
+    clear message rather than starting the daemon and having every download fail.
+    """
+    path = Path(path).expanduser()
+    if not path.exists():
+        return [
+            f"cookies file not found at {path}",
+            "drop a Netscape cookies.txt there, or load one via "
+            "`scrap-pub cookies /path/to/cookies.txt` before starting the daemon",
+        ]
+    try:
+        cookies = _parse_cookies_file(path)
+    except Exception as e:
+        return [f"could not parse cookies file {path}: {e}"]
+    missing = validate_cookies(cookies)
+    if missing:
+        return [
+            f"cookies file {path} is missing required keys: {missing}",
+            "export a fresh cookies.txt from your browser and "
+            "load it via `scrap-pub cookies /path/to/cookies.txt`",
+        ]
+    return []
 
 
 def is_login_response(html: str) -> bool:

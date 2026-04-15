@@ -8,8 +8,11 @@ The HTTP server runs in a daemon thread. It handles:
 """
 
 import json
+import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .config import Config
@@ -46,5 +49,5 @@ def start_http_server(config: "Config") -> None:
                 self.end_headers()
 
     server = HTTPServer(("localhost", port), Handler)
-    print(f"[http] Serving web UI at http://localhost:{port}")
+    log.info("Serving web UI at http://localhost:%d", port)
     server.serve_forever()

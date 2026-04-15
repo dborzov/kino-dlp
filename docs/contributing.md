@@ -95,10 +95,14 @@ uv run ruff check --fix scrap_pub/ tests/    # auto-fix
 Tests cover protocol and unit behavior. To verify a real download works you need real cookies.
 
 ```bash
-# 1. start the daemon — validate-fail case should exit 2 cleanly
-scrap-pub config --set website=""   # make it bad on purpose
-scrap-pub-server                    # expect: "`website` is not set ..." and exit 2
+# 1. start the daemon — validate-fail cases should exit 2 cleanly, no restart loop
+scrap-pub config --set website=""   # bad config
+scrap-pub-server                    # expect: "website is not set ..." and exit 2
 scrap-pub config --set website="https://example.com"
+
+mv ~/.config/scrap-pub/cookies.txt ~/.config/scrap-pub/cookies.txt.bak  # missing cookies
+scrap-pub-server                    # expect: "cookies file not found ..." and exit 2
+mv ~/.config/scrap-pub/cookies.txt.bak ~/.config/scrap-pub/cookies.txt  # restore
 
 # 2. start the daemon for real
 scrap-pub-server

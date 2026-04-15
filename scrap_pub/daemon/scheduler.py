@@ -6,12 +6,15 @@ AppState is the single shared-state object passed to all async components.
 
 import asyncio
 import functools
+import logging
 import signal
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .config import Config
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -90,6 +93,12 @@ async def worker_task(worker_id: int, state: AppState) -> None:
             await download_task(task, state)
         except Exception as e:
             from .db import db_log, db_set_task_status
+            title = task.get("plex_stem") or task.get("episode_title") or task.get("kind", "?")
+            log.error(
+                "Worker %d unhandled crash on task %d (%s): %s",
+                worker_id, task["id"], title, e,
+                exc_info=True,
+            )
             await db_run(state, db_set_task_status, state.conn, task["id"], "failed", error=str(e))
             await db_run(state, db_log, state.conn, "ERROR", f"Worker {worker_id} crash: {e}", task["id"])
         finally:
@@ -187,9 +196,9 @@ async def main(config: Config) -> None:
     loop.add_signal_handler(signal.SIGTERM, _shutdown)
     loop.add_signal_handler(signal.SIGINT,  _shutdown)
 
-    print(f"[daemon] Starting — http://localhost:{config.http_port}  ws://localhost:{config.ws_port}")
-    print(f"[daemon] Output: {config.output_dir}")
-    print(f"[daemon] DB:     {config.db_path}")
+    log.info("Starting — http://localhost:%d  ws://localhost:%d", config.http_port, config.ws_port)
+    log.info("Output: %s", config.output_dir)
+    log.info("DB:     %s", config.db_path)
 
     # Launch async tasks
     tasks = [
@@ -204,7 +213,7 @@ async def main(config: Config) -> None:
 
     await state.shutdown_event.wait()
 
-    print("[daemon] Shutting down...")
+    log.info("Shutting down...")
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -212,4 +221,4 @@ async def main(config: Config) -> None:
     state.db_executor.shutdown(wait=False)
     state.net_executor.shutdown(wait=False)
     conn.close()
-    print("[daemon] Done.")
+    log.info("Done.")

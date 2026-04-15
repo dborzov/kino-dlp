@@ -90,8 +90,11 @@ uv add --dev <package>    # dev dependency
 `scrap-pub list` accepts `--status`, `--kind`, `--since`, `--until`,
 `--completed-since`, `--offset`, `-v/--verbose`, and `--json`.
 `scrap-pub sql` is read-only by default (only `SELECT`/`WITH`/`PRAGMA`/`EXPLAIN`);
-pass `--write` to run DML/DDL. The daemon refuses to start if `website` is
-missing or malformed — see `Config.validate()` in `scrap_pub/daemon/config.py`.
+pass `--write` to run DML/DDL. The daemon refuses to start (exit 2) if `website` is
+missing or malformed (`Config.validate()`), or if the cookies file is absent,
+unparseable, or missing required keys (`session.check_cookies_file()` called from
+`server_main.py`). Both are hard stops — the daemon never starts a download loop
+it knows will fail on every attempt.
 
 ## Session cookies
 

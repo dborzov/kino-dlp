@@ -70,8 +70,14 @@ have in a logged-in browser on the target site. scrap-pub stores them in a
 
 ### Required cookies
 
-The file must contain all five of these (the daemon rejects uploads missing
-any of them):
+The daemon **refuses to start** (exit 2) if the cookies file is absent,
+unparseable, or missing any required key — the same hard stop as a missing
+`website` config value. This is intentional: a running daemon with no cookies
+is useless and would silently fail every download. Fix the cookies file and
+restart.
+
+The file must contain all five of these (the daemon also rejects live uploads
+via `scrap-pub cookies FILE` that are missing any of them):
 
 | Cookie | What it is |
 |--------|------------|
@@ -98,14 +104,16 @@ approach yt-dlp documents for logged-in sites:
 4. Save the file and load it into the daemon one of two ways:
 
    ```bash
-   # Option A — drop it at the default path (daemon picks it up on startup)
+   # Option A — drop it at the default path before starting the daemon
    mv ~/Downloads/site_cookies.txt ~/.config/scrap-pub/cookies.txt
 
-   # Option B — hot-reload into a running daemon
+   # Option B — hot-reload into a running daemon (for refreshing expired cookies)
    scrap-pub cookies ~/Downloads/site_cookies.txt
    ```
 
-Option B validates the file, atomically replaces `cookies_path`, clears the
+Option A is required for first-time setup — the daemon checks the cookies file
+at startup and will refuse to start if it is missing or invalid. Option B
+validates the file, atomically replaces `cookies_path`, clears the
 `cookie_error` flag, and resumes paused workers — no restart needed.
 
 ### When to refresh

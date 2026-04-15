@@ -7,11 +7,14 @@ broadcast(state, msg) — send a JSON message to all connected clients
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 
 import websockets
 import websockets.asyncio.server
+
+log = logging.getLogger(__name__)
 
 from .ws_protocol import (
     CMD_ADD_AUDIO,
@@ -602,5 +605,5 @@ async def serve_ws(state) -> None:
         ping_interval=30,
         ping_timeout=10,
     ):
-        print(f"[ws] Listening on ws://localhost:{config.ws_port}")
+        log.info("Listening on ws://localhost:%d", config.ws_port)
         await state.shutdown_event.wait()

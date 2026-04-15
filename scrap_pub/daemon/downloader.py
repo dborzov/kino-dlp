@@ -12,8 +12,11 @@ add_sub_to_task(task_id, url, lang, state)
   Download an extra subtitle and save as a .srt sidecar.
 """
 
+import logging
 import shutil
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 from .config import (
     Config,
@@ -123,11 +126,22 @@ async def download_task(task: dict, state) -> None:
     config  = state.config
     conn    = state.conn
 
+    # Build a short human-readable label for every log line emitted by this task.
+    # plex_stem carries the full "Show(Year) - s01e03 - Title" slug when available.
+    _title = task.get("plex_stem") or task.get("episode_title") or task.get("kind", "?")
+    _prefix = f"[task {task_id} | {_title}]"
+
     def log(level: str, msg: str):
         state.loop.create_task(
             db_run(state, db_log, conn, level, msg, task_id)
         )
-        print(f"[task {task_id}] {level}: {msg}")
+        full = f"{_prefix} {msg}"
+        if level == "ERROR":
+            _log.error(full)
+        elif level == "WARN":
+            _log.warning(full)
+        else:
+            _log.info(full)
 
     log("INFO", f"Starting task — {task.get('plex_stem') or task.get('episode_title') or task['kind']}")
 
